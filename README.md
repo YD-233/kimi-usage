@@ -2,19 +2,21 @@
 
 **[Kimi Code CLI](https://www.kimi.com/code/docs/kimi-code-cli/) 插件：把每轮 token 用量显示在终端标题栏。**
 
-> 标题栏只是**过渡方案**。目前 kimi-code 没有任何能在不污染模型上下文的前提下显示自定义文本的渠道，标题栏是唯一可行解。等官方支持 statusLine（[MoonshotAI/kimi-code#1171](https://github.com/MoonshotAI/kimi-code/issues/1171)）或其他显示能力后，本插件会迁移到更合适的显示方式，详见[后续计划](#后续计划)。
-
 每轮对话结束时，插件会把本轮 token 用量、缓存命中率和会话累计写入终端标题：
 
 ```
-📊 turn ↑1.26M/↓8.4k · cache 99% · total ↑19.15M/↓115.8k | 我的会话标题
+📊 本轮 ↑1.26M/↓8.4k · 缓存 99% · 累计 ↑19.15M/↓115.8k | 我的会话标题
 ```
 
 - **零上下文消耗** —— 不会有任何内容被注入模型上下文
 - **精确到轮末** —— 由 `Stop` hook 驱动，模型结束本轮的瞬间触发
 - **零依赖** —— 单个 Python 3.7+ 标准库脚本
 
+> 标题栏只是**过渡方案**。目前 kimi-code 没有任何能在不污染模型上下文的前提下显示自定义文本的渠道，标题栏是唯一可行解。等官方支持 statusLine（[MoonshotAI/kimi-code#1171](https://github.com/MoonshotAI/kimi-code/issues/1171)）或其他显示能力后，本插件会迁移到更合适的显示方式，详见[后续计划](#后续计划)。
+
 ## 安装
+
+前置条件：系统已安装 Python 3.7+，且 `python` 或 `python3` 在 `PATH` 上。
 
 在 Kimi Code CLI 的 TUI 中：
 
@@ -23,8 +25,40 @@
 /reload
 ```
 
-之后每轮结束标题自动更新。卸载：`/plugins remove kimi-usage`。
-指定版本：`/plugins install https://github.com/YD-233/kimi-usage/releases/tag/v1.0.0`。
+之后每轮结束标题自动更新。
+
+- 卸载：`/plugins remove kimi-usage`
+- 指定版本：`/plugins install https://github.com/YD-233/kimi-usage/releases/tag/v1.0.3`
+
+## 平台支持
+
+| 平台 | 状态 |
+| --- | --- |
+| Linux | 已验证（GNOME Terminal；理论上任何支持 OSC 标题的终端都行） |
+| Windows | 已验证（Warp、Windows Terminal；新版 conhost 同理） |
+| macOS | 未测试——有 `/dev/tty` 兜底；欢迎反馈 |
+
+已知限制：
+
+- TUI 在切换会话、会话改名、`/reload` 时会重置标题；下一轮结束时会写回。
+- 终端必须能解析 OSC 0 标题序列。Windows 上 mintty（Git Bash 默认终端）不走 conhost，无法显示标题——请使用 Windows Terminal、Warp 等现代终端。
+
+### 排查问题
+
+如果标题没有变化，手动跑一次 hook 并打开调试输出：
+
+```sh
+# Linux / macOS
+echo '{"hook_event_name":"Stop","cwd":"'"$PWD"'"}' | KIMI_USAGE_DEBUG=1 python3 ~/.kimi-code/plugins/managed/kimi-usage/scripts/usage.py
+```
+
+```cmd
+:: Windows（在你的项目目录下运行）
+set KIMI_USAGE_DEBUG=1
+echo {"hook_event_name":"Stop","cwd":"%CD%"} | python %USERPROFILE%\.kimi-code\plugins\managed\kimi-usage\scripts\usage.py
+```
+
+调试输出会显示写入了哪个终端目标（或为什么失败）。如果命令本身跑不起来，请安装 Python 3 或确认 `python`/`python3` 在 `PATH` 上。
 
 ## 工作原理
 
@@ -41,7 +75,7 @@
 | statusLine / 状态栏配置 | 不存在。`tui.toml` 只有 5 个键（主题、编辑器、通知等） |
 | `UserPromptSubmit` hook 输出 | 唯一会在 TUI 渲染的 hook 输出，但 ① 显示时机是**下一轮开头**而非本轮结束；② 文本会作为 `hook_result` 消息追加进模型上下文——每轮都在烧 token |
 | `Stop` hook 输出 | 正常允许时 stdout 被丢弃；只有 *block* 结果会被消费——而 block 会强制模型多跑一步（每轮多一次 LLM 调用） |
-| 其余 14 个 hook 事件 | 全部是 fire-and-forget，输出被丢弃 |
+| 其余 hook 事件 | 输出要么被丢弃，要么只用于阻断流程——都不会在 TUI 渲染自定义文本 |
 | 插件斜杠命令 | 命令体只能是发给模型的 prompt——不能直接执行脚本，所以报告必然进入上下文 |
 | `kimi server` 消息注入 | server 是独立进程，不与 TUI 共享会话的实时状态；REST API 对 transcript 只读 |
 | 追加写 `wire.jsonl` | 运行中的 TUI 只写这个文件；追加的记录要等 resume/回放才可见 |
@@ -63,33 +97,6 @@
 - 其他不进入模型上下文的展示渠道，例如 hook 输出可选择不注入上下文、插件自定义 UI 面板等
 
 迁移后标题栏写入会保留为可选的兜底方式（比如在 ssh、tmux 等场景下仍然有用）。
-
-## 平台支持
-
-| 平台 | 状态 |
-| --- | --- |
-| Linux | 已验证（GNOME Terminal；理论上任何支持 OSC 标题的终端都行） |
-| Windows | 已验证（Warp；经 `AttachConsole` 附着到 TUI 真实控制台后写 OSC 0，Windows Terminal、新版 conhost 同理） |
-| macOS | 未测试——有 `/dev/tty` 兜底；欢迎 PR |
-
-已知限制：TUI 在切换会话、会话改名、`/reload` 时会重置标题；下一轮结束时会写回。
-
-### 排查问题
-
-如果标题没有变化，手动跑一次 hook 并打开调试输出：
-
-```sh
-# Linux / macOS
-echo '{"hook_event_name":"Stop","cwd":"'"$PWD"'"}' | KIMI_USAGE_DEBUG=1 python3 ~/.kimi-code/plugins/managed/kimi-usage/scripts/usage.py
-```
-
-```cmd
-:: Windows（在你的项目目录下运行）
-set KIMI_USAGE_DEBUG=1
-echo {"hook_event_name":"Stop","cwd":"%CD%"} | python3 %USERPROFILE%\.kimi-code\plugins\managed\kimi-usage\scripts\usage.py
-```
-
-调试输出会显示写入了哪个终端目标（或每个候选为什么失败）。如果命令本身跑不起来，请安装 Python 3 或确认 `python3`/`python` 在 `PATH` 上。
 
 ## License
 
