@@ -1,6 +1,6 @@
 # kimi-usage
 
-**[Kimi Code CLI](https://www.kimi.com/code/docs/kimi-code-cli/) 插件：把每轮 token 用量显示在终端标题栏。**
+**[Kimi Code CLI](https://github.com/MoonshotAI/kimi-code) 插件：把每轮 token 用量显示在终端标题栏。**
 
 每轮对话结束时，插件会把本轮 token 用量、缓存命中率和会话累计写入终端标题：
 
