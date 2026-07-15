@@ -22,7 +22,7 @@
 - **精确到轮末** —— 由 `Stop` hook 驱动，模型结束本轮的瞬间触发
 - **零依赖** —— 单个 Python 3.7+ 标准库脚本
 
-> 标题栏只是**过渡方案**。目前 kimi-code 没有任何能在不污染模型上下文的前提下显示自定义文本的渠道，标题栏是唯一可行解。等官方支持 statusLine（[MoonshotAI/kimi-code#1171](https://github.com/MoonshotAI/kimi-code/issues/1171)）或其他显示能力后，本插件会迁移到更合适的显示方式，详见[后续计划](#后续计划)。
+> 标题栏只是**过渡方案**。目前 kimi-code 没有任何能在不污染模型上下文的前提下显示自定义文本的渠道，标题栏是唯一可行解。等官方提供可自定义的 statusLine 或其他显示能力后，本插件会迁移到更合适的显示方式，详见[后续计划](#后续计划)。
 
 ## 安装
 
@@ -78,7 +78,7 @@ echo {"hook_event_name":"Stop","cwd":"%CD%"} | python %USERPROFILE%\.kimi-code\p
 
 ## 为什么是标题栏，而不是对话界面
 
-目前官方没有任何渠道能在不污染模型上下文的前提下向 TUI 显示自定义文本（statusLine 的需求 [MoonshotAI/kimi-code#1171](https://github.com/MoonshotAI/kimi-code/issues/1171) 仍挂着）。以下每个备选方案都对着 kimi-code 0.24.1 源码验证过：
+目前官方没有任何渠道能在不污染模型上下文的前提下向 TUI 显示自定义文本。以下每个备选方案都对着 kimi-code 0.24.1 源码验证过：
 
 | 方案 | 问题 |
 | --- | --- |
@@ -103,7 +103,7 @@ echo {"hook_event_name":"Stop","cwd":"%CD%"} | python %USERPROFILE%\.kimi-code\p
 
 标题栏显示是现阶段的权宜之计，不是最终形态。kimi-code 还在快速迭代，一旦官方提供以下任一能力，插件会第一时间迁移显示方式：
 
-- **statusLine / 状态栏**（[MoonshotAI/kimi-code#1171](https://github.com/MoonshotAI/kimi-code/issues/1171)）——最理想的形态，常驻 TUI 底部
+- **可自定义的 statusLine / 状态栏 API**——最理想的形态，常驻 TUI 底部
 - 其他不进入模型上下文的展示渠道，例如 hook 输出可选择不注入上下文、插件自定义 UI 面板等
 
 迁移后标题栏写入会保留为可选的兜底方式（比如在 ssh、tmux 等场景下仍然有用）。
