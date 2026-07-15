@@ -257,6 +257,86 @@ def find_ancestor_tty():
     return None
 
 
+def win_ancestors():
+    """Return [(pid, exe_name)] of this process's ancestors, nearest first."""
+    import ctypes
+    from ctypes import wintypes
+
+    class PROCESSENTRY32W(ctypes.Structure):
+        _fields_ = [("dwSize", wintypes.DWORD), ("cntUsage", wintypes.DWORD),
+                    ("th32ProcessID", wintypes.DWORD),
+                    ("th32DefaultHeapID", ctypes.c_void_p),
+                    ("th32ModuleID", wintypes.DWORD),
+                    ("cntThreads", wintypes.DWORD),
+                    ("th32ParentProcessID", wintypes.DWORD),
+                    ("pcPriClassBase", ctypes.c_long),
+                    ("dwFlags", wintypes.DWORD),
+                    ("szExeFile", wintypes.WCHAR * wintypes.MAX_PATH)]
+
+    k32 = ctypes.windll.kernel32
+    snap = k32.CreateToolhelp32Snapshot(2, 0)  # TH32CS_SNAPPROCESS
+    if snap == -1:
+        return []
+    try:
+        pe = PROCESSENTRY32W()
+        pe.dwSize = ctypes.sizeof(pe)
+        parents = {}
+        if k32.Process32FirstW(snap, ctypes.byref(pe)):
+            while True:
+                parents[pe.th32ProcessID] = (pe.th32ParentProcessID,
+                                             pe.szExeFile)
+                if not k32.Process32NextW(snap, ctypes.byref(pe)):
+                    break
+    finally:
+        k32.CloseHandle(snap)
+    chain = []
+    pid = os.getppid()
+    while pid in parents:
+        chain.append((pid, parents[pid][1]))
+        pid = parents[pid][0]
+    return chain
+
+
+def win_attach_real_console():
+    """Attach to the console of the nearest ancestor outside our own.
+
+    On Windows the hook engine spawns children into a private, windowless
+    console (ConPTY), so writing CONOUT$ there reaches nothing visible.
+    Detach from it and attach to the first ancestor that isn't in our
+    console's process list — that's the kimi TUI's real console."""
+    import ctypes
+    k32 = ctypes.windll.kernel32
+    n = 64
+    procs = (ctypes.c_ulong * n)()
+    count = k32.GetConsoleProcessList(procs, n)
+    own = set(procs[:min(count, n)]) if count else set()
+    k32.FreeConsole()
+    for pid, _name in win_ancestors():
+        if pid in own:
+            continue
+        if k32.AttachConsole(pid):
+            return True
+    return False
+
+
+def win_write_console(text):
+    """Write text to the console screen buffer via WriteConsoleW.
+
+    UTF-16 output avoids console-code-page (e.g. CP936) mangling of the
+    non-ASCII parts of the title."""
+    import ctypes
+    k32 = ctypes.windll.kernel32
+    h = k32.CreateFileW("CONOUT$", 0x40000000, 3, None, 3, 0, None)
+    if h == -1:
+        return False
+    try:
+        written = ctypes.c_ulong(0)
+        return bool(k32.WriteConsoleW(h, text, len(text),
+                                      ctypes.byref(written), None))
+    finally:
+        k32.CloseHandle(h)
+
+
 def set_terminal_title(text):
     """Write an OSC 0 title escape straight to the terminal.
 
@@ -268,11 +348,16 @@ def set_terminal_title(text):
     seq = f"\x1b]0;{safe}\x07"
     debug = os.environ.get("KIMI_USAGE_DEBUG")
     if os.name == "nt":
-        # Windows: no /dev/tty, but the console output stream is CONOUT$.
-        # Windows Terminal, Warp and modern conhost all parse OSC 0.
-        candidates = ["CONOUT$"]
-    else:
-        candidates = [find_ancestor_tty(), "/dev/tty"]
+        # Attach to the TUI's real console first (hooks run in a private
+        # one), then the OSC 0 write reaches the terminal — Windows
+        # Terminal, Warp and modern conhost all parse OSC 0.
+        win_attach_real_console()
+        ok = win_write_console(seq)
+        if debug:
+            print(f"kimi-usage: console write {'ok' if ok else 'failed'}",
+                  file=sys.stderr)
+        return
+    candidates = [find_ancestor_tty(), "/dev/tty"]
     for path in dict.fromkeys(c for c in candidates if c):
         try:
             with open(path, "w", encoding="utf-8", errors="ignore") as tty:

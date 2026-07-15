@@ -53,7 +53,7 @@
 - `Stop` hook 的输出反正被丢弃——脚本自己写 OSC 0 序列，产生零上下文。
 - `Stop` 恰好在模型结束本轮时触发。
 - 转义序列不输出可见字符、不移动光标，渲染器的记账不受影响。
-- hook 子进程被 `setsid` 丢了控制终端（所以 `/dev/tty` 不可用）；脚本沿 `/proc` 的父进程链找到 TUI 进程真正的 `/dev/pts/N`。Windows 上则改写 `CONOUT$`。
+- hook 子进程被 `setsid` 丢了控制终端（所以 `/dev/tty` 不可用）；脚本沿 `/proc` 的父进程链找到 TUI 进程真正的 `/dev/pts/N`。Windows 上 hook 子进程则被放进一个无窗口的私有控制台，直接写 `CONOUT$` 不可见；脚本沿父进程链 `AttachConsole` 附着到 kimi 主进程的真实控制台，再用 `WriteConsoleW` 写入 OSC 0。
 
 ## 后续计划
 
@@ -69,7 +69,7 @@
 | 平台 | 状态 |
 | --- | --- |
 | Linux | 已验证（GNOME Terminal；理论上任何支持 OSC 标题的终端都行） |
-| Windows | 通过 `CONOUT$` 支持（Windows Terminal、Warp、新版 conhost）——欢迎反馈 |
+| Windows | 已验证（Warp；经 `AttachConsole` 附着到 TUI 真实控制台后写 OSC 0，Windows Terminal、新版 conhost 同理） |
 | macOS | 未测试——有 `/dev/tty` 兜底；欢迎 PR |
 
 已知限制：TUI 在切换会话、会话改名、`/reload` 时会重置标题；下一轮结束时会写回。
