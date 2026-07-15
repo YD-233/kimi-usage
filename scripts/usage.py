@@ -190,15 +190,17 @@ def parse_session(session_dir):
 # --------------------------------------------------------------------------
 
 def stats_line(turn_usage, session_total):
+    """Compact one-line stats; most important info (this turn's usage and
+    cache hit rate) first, so it survives narrow terminal tabs."""
     parts = []
     if turn_usage is not None:
         parts.append(
-            f"本轮 ↑{fmt_tokens(input_total(turn_usage))}"
+            f"↑{fmt_tokens(input_total(turn_usage))}"
             f"/↓{fmt_tokens(turn_usage['output'])}")
         rate = cache_hit_rate(turn_usage)
         if rate is not None:
             parts.append(f"缓存 {rate}%")
-    parts.append(f"累计 ↑{fmt_tokens(input_total(session_total))}"
+    parts.append(f"总 ↑{fmt_tokens(input_total(session_total))}"
                  f"/↓{fmt_tokens(session_total['output'])}")
     return " · ".join(parts)
 
@@ -258,42 +260,43 @@ def find_ancestor_tty():
 
 
 def win_ancestors():
-    """Return [(pid, exe_name)] of this process's ancestors, nearest first."""
+    """Return pids of this process's ancestors, nearest first.
+
+    Walks the parent chain via NtQueryInformationProcess rather than
+    CreateToolhelp32Snapshot: the snapshot API takes a system-wide lock
+    and can block for a long time on a busy machine (observed in the
+    wild: the Stop hook hung inside it until the 10s hook timeout killed
+    it)."""
     import ctypes
-    from ctypes import wintypes
-
-    class PROCESSENTRY32W(ctypes.Structure):
-        _fields_ = [("dwSize", wintypes.DWORD), ("cntUsage", wintypes.DWORD),
-                    ("th32ProcessID", wintypes.DWORD),
-                    ("th32DefaultHeapID", ctypes.c_void_p),
-                    ("th32ModuleID", wintypes.DWORD),
-                    ("cntThreads", wintypes.DWORD),
-                    ("th32ParentProcessID", wintypes.DWORD),
-                    ("pcPriClassBase", ctypes.c_long),
-                    ("dwFlags", wintypes.DWORD),
-                    ("szExeFile", wintypes.WCHAR * wintypes.MAX_PATH)]
-
     k32 = ctypes.windll.kernel32
-    snap = k32.CreateToolhelp32Snapshot(2, 0)  # TH32CS_SNAPPROCESS
-    if snap == -1:
-        return []
-    try:
-        pe = PROCESSENTRY32W()
-        pe.dwSize = ctypes.sizeof(pe)
-        parents = {}
-        if k32.Process32FirstW(snap, ctypes.byref(pe)):
-            while True:
-                parents[pe.th32ProcessID] = (pe.th32ParentProcessID,
-                                             pe.szExeFile)
-                if not k32.Process32NextW(snap, ctypes.byref(pe)):
-                    break
-    finally:
-        k32.CloseHandle(snap)
-    chain = []
+    ntdll = ctypes.windll.ntdll
+
+    class PROCESS_BASIC_INFORMATION(ctypes.Structure):
+        _fields_ = [("Reserved1", ctypes.c_void_p),
+                    ("PebBaseAddress", ctypes.c_void_p),
+                    ("Reserved2", ctypes.c_void_p * 2),
+                    ("UniqueProcessId", ctypes.c_void_p),
+                    ("InheritedFromUniqueProcessId", ctypes.c_void_p)]
+
+    def ppid_of(pid):
+        h = k32.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
+        if not h:
+            return 0
+        try:
+            pbi = PROCESS_BASIC_INFORMATION()
+            if ntdll.NtQueryInformationProcess(
+                    h, 0, ctypes.byref(pbi), ctypes.sizeof(pbi), None) != 0:
+                return 0
+            return int(pbi.InheritedFromUniqueProcessId or 0)
+        finally:
+            k32.CloseHandle(h)
+
+    chain, seen = [], set()
     pid = os.getppid()
-    while pid in parents:
-        chain.append((pid, parents[pid][1]))
-        pid = parents[pid][0]
+    while pid and pid not in seen and len(chain) < 32:
+        seen.add(pid)
+        chain.append(pid)
+        pid = ppid_of(pid)
     return chain
 
 
@@ -301,7 +304,7 @@ def win_attach_real_console():
     """Attach to the console of the nearest ancestor outside our own.
 
     On Windows the hook engine spawns children into a private, windowless
-    console (ConPTY), so writing CONOUT$ there reaches nothing visible.
+    console (ConPTY), so that console's title reaches nothing visible.
     Detach from it and attach to the first ancestor that isn't in our
     console's process list — that's the kimi TUI's real console."""
     import ctypes
@@ -311,7 +314,7 @@ def win_attach_real_console():
     count = k32.GetConsoleProcessList(procs, n)
     own = set(procs[:min(count, n)]) if count else set()
     k32.FreeConsole()
-    for pid, _name in win_ancestors():
+    for pid in win_ancestors():
         if pid in own:
             continue
         if k32.AttachConsole(pid):
@@ -319,44 +322,29 @@ def win_attach_real_console():
     return False
 
 
-def win_write_console(text):
-    """Write text to the console screen buffer via WriteConsoleW.
-
-    UTF-16 output avoids console-code-page (e.g. CP936) mangling of the
-    non-ASCII parts of the title."""
-    import ctypes
-    k32 = ctypes.windll.kernel32
-    h = k32.CreateFileW("CONOUT$", 0x40000000, 3, None, 3, 0, None)
-    if h == -1:
-        return False
-    try:
-        written = ctypes.c_ulong(0)
-        return bool(k32.WriteConsoleW(h, text, len(text),
-                                      ctypes.byref(written), None))
-    finally:
-        k32.CloseHandle(h)
-
-
 def set_terminal_title(text):
-    """Write an OSC 0 title escape straight to the terminal.
+    """Set the terminal title to the given text.
 
     The kimi TUI only sets the title on session switch / title change, so
-    a Stop-hook write survives until then. Escape sequences emit no
-    printable characters and don't move the cursor, so the TUI's
-    differential rendering bookkeeping is unaffected."""
+    a Stop-hook write survives until then. On POSIX this writes an OSC 0
+    escape straight to the tty: escape sequences emit no printable
+    characters and don't move the cursor, so the TUI's differential
+    rendering bookkeeping is unaffected. On Windows it calls
+    SetConsoleTitleW on the TUI's console (see win_attach_real_console):
+    the title is set directly without going through the OSC parser, so
+    emoji/CJK survive and no BEL can leak out as a beep; ConPTY forwards
+    the title change to the terminal."""
     safe = "".join(ch for ch in text if ch.isprintable())
-    seq = f"\x1b]0;{safe}\x07"
     debug = os.environ.get("KIMI_USAGE_DEBUG")
     if os.name == "nt":
-        # Attach to the TUI's real console first (hooks run in a private
-        # one), then the OSC 0 write reaches the terminal — Windows
-        # Terminal, Warp and modern conhost all parse OSC 0.
+        import ctypes
         win_attach_real_console()
-        ok = win_write_console(seq)
+        ok = bool(ctypes.windll.kernel32.SetConsoleTitleW(safe))
         if debug:
-            print(f"kimi-usage: console write {'ok' if ok else 'failed'}",
+            print(f"kimi-usage: SetConsoleTitleW {'ok' if ok else 'failed'}",
                   file=sys.stderr)
         return
+    seq = f"\x1b]0;{safe}\x07"
     candidates = [find_ancestor_tty(), "/dev/tty"]
     for path in dict.fromkeys(c for c in candidates if c):
         try:
@@ -384,7 +372,7 @@ def main():
     if turn_usage is None and not session_total["output"]:
         return
 
-    line = "📊 " + stats_line(turn_usage, session_total)
+    line = stats_line(turn_usage, session_total)
     title = session_title(session_dir)
     set_terminal_title(line + (f" | {title}" if title else ""))
 

@@ -5,8 +5,10 @@
 每轮对话结束时，插件会把本轮 token 用量、缓存命中率和会话累计写入终端标题：
 
 ```
-📊 本轮 ↑1.26M/↓8.4k · 缓存 99% · 累计 ↑19.15M/↓115.8k | 我的会话标题
+↑1.26M/↓8.4k · 缓存 99% · 总 ↑19.15M/↓115.8k | 我的会话标题
 ```
+
+最重要的信息（本轮输入/输出 + 缓存命中率）排在最前，窄标签页也能完整显示；累计用量和会话标题在后，悬停标签页或看窗口标题栏可见完整内容。
 
 - **零上下文消耗** —— 不会有任何内容被注入模型上下文
 - **精确到轮末** —— 由 `Stop` hook 驱动，模型结束本轮的瞬间触发
@@ -87,7 +89,7 @@ echo {"hook_event_name":"Stop","cwd":"%CD%"} | python %USERPROFILE%\.kimi-code\p
 - `Stop` hook 的输出反正被丢弃——脚本自己写 OSC 0 序列，产生零上下文。
 - `Stop` 恰好在模型结束本轮时触发。
 - 转义序列不输出可见字符、不移动光标，渲染器的记账不受影响。
-- hook 子进程被 `setsid` 丢了控制终端（所以 `/dev/tty` 不可用）；脚本沿 `/proc` 的父进程链找到 TUI 进程真正的 `/dev/pts/N`。Windows 上 hook 子进程则被放进一个无窗口的私有控制台，直接写 `CONOUT$` 不可见；脚本沿父进程链 `AttachConsole` 附着到 kimi 主进程的真实控制台，再用 `WriteConsoleW` 写入 OSC 0。
+- hook 子进程被 `setsid` 丢了控制终端（所以 `/dev/tty` 不可用）；脚本沿 `/proc` 的父进程链找到 TUI 进程真正的 `/dev/pts/N`，写入 OSC 0。Windows 上 hook 子进程则被放进一个无窗口的私有控制台；脚本沿父进程链（`NtQueryInformationProcess`，不用会偶发阻塞的进程快照 API）`AttachConsole` 附着到 kimi 主进程的真实控制台，再用 `SetConsoleTitleW` 直接设置控制台标题——不经过 OSC 解析器，中文等 Unicode 字符不会出问题，ConPTY 会把标题变化转发给终端。
 
 ## 后续计划
 
