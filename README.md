@@ -1,22 +1,18 @@
 # kimi-usage
 
-**[Kimi Code CLI](https://github.com/MoonshotAI/kimi-code) 插件：把每轮 token 用量显示在终端标题栏。**
+**[Kimi Code CLI](https://github.com/MoonshotAI/kimi-code) 插件：把 token 用量显示在终端标题栏。**
 
 每轮对话结束时，插件会把本轮 token 用量、缓存命中率和会话累计写入终端标题：
 
 ```
-本轮 ↑ 1.26M ↓ 8.4k · 缓存 99% · 总计 ↑ 19.15M ↓ 115.8k | 我的会话标题
+本轮 ↑ 1.26M ↓ 8.4k · 缓存 99% · 总计 ↑ 19.15M ↓ 115.8k | 会话标题
 ```
-
-最重要的信息（本轮输入/输出 + 缓存命中率）排在最前，窄标签页也能完整显示；累计用量和会话标题在后，悬停标签页或看窗口标题栏可见完整内容。
 
 ## 效果预览
 
 | Windows Terminal | Warp | Linux (GNOME Terminal) |
 | --- | --- | --- |
 | ![Windows Terminal](images/Windows-terminal.png) | ![Warp](images/Windows-warp.png) | ![GNOME Terminal](images/fedora.png) |
-
-标签页宽度有限时只显示前半段，悬停可见完整标题（Windows 两张截图即悬停效果）。
 
 > **为什么是标题栏？** kimi-code 目前没有任何能在不污染模型上下文的前提下向 TUI 显示自定义文本的渠道：statusLine 配置不存在，hook 输出要么被丢弃、要么会注入上下文烧 token。标题栏是唯一同时满足**零上下文消耗、轮末时机、不破坏 TUI** 的显示方式。等官方提供可自定义的 statusLine 或其他显示能力后，本插件会迁移，详见[后续计划](#后续计划)。
 
@@ -60,7 +56,7 @@
 
 ## 后续计划
 
-标题栏显示是现阶段的权宜之计，不是最终形态。kimi-code 还在快速迭代，一旦官方提供以下任一能力，插件会第一时间迁移显示方式：
+标题栏显示是现阶段的权宜之计，一旦官方提供以下任一能力，插件会第一时间迁移显示方式：
 
 - **可自定义的 statusLine / 状态栏 API**——最理想的形态，常驻 TUI 底部
 - 其他不进入模型上下文的展示渠道，例如 hook 输出可选择不注入上下文、插件自定义 UI 面板等
