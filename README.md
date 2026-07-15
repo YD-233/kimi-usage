@@ -10,6 +10,14 @@
 
 最重要的信息（本轮输入/输出 + 缓存命中率）排在最前，窄标签页也能完整显示；累计用量和会话标题在后，悬停标签页或看窗口标题栏可见完整内容。
 
+## 效果预览
+
+| Windows Terminal | Warp | Linux (GNOME Terminal) |
+| --- | --- | --- |
+| ![Windows Terminal](images/Windows-terminal.png) | ![Warp](images/Windows-warp.png) | ![GNOME Terminal](images/fedora.png) |
+
+标签页宽度有限时只显示前半段，悬停可见完整标题（Windows 两张截图即悬停效果）。
+
 - **零上下文消耗** —— 不会有任何内容被注入模型上下文
 - **精确到轮末** —— 由 `Stop` hook 驱动，模型结束本轮的瞬间触发
 - **零依赖** —— 单个 Python 3.7+ 标准库脚本
