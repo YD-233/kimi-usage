@@ -1,0 +1,16 @@
+{
+  "name": "kimi-usage",
+  "version": "1.0.0",
+  "description": "Show per-turn token usage and cache hit rate in the terminal title bar",
+  "interface": {
+    "displayName": "Kimi Usage Meter",
+    "shortDescription": "Per-turn token / cache hit stats in the terminal title"
+  },
+  "hooks": [
+    {
+      "event": "Stop",
+      "command": "python3 ./scripts/usage.py",
+      "timeout": 10
+    }
+  ]
+}
