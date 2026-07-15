@@ -195,13 +195,13 @@ def stats_line(turn_usage, session_total):
     parts = []
     if turn_usage is not None:
         parts.append(
-            f"↑{fmt_tokens(input_total(turn_usage))}"
-            f"/↓{fmt_tokens(turn_usage['output'])}")
+            f"本轮 ↑ {fmt_tokens(input_total(turn_usage))}"
+            f" ↓ {fmt_tokens(turn_usage['output'])}")
         rate = cache_hit_rate(turn_usage)
         if rate is not None:
             parts.append(f"缓存 {rate}%")
-    parts.append(f"总 ↑{fmt_tokens(input_total(session_total))}"
-                 f"/↓{fmt_tokens(session_total['output'])}")
+    parts.append(f"总计 ↑ {fmt_tokens(input_total(session_total))}"
+                 f" ↓ {fmt_tokens(session_total['output'])}")
     return " · ".join(parts)
 
 

@@ -1,6 +1,6 @@
 {
   "name": "kimi-usage",
-  "version": "1.0.4",
+  "version": "1.0.5",
   "description": "在终端标题栏显示每轮 token 用量与缓存命中率（标题栏为过渡方案，待 kimi-code 官方支持 statusLine 后迁移显示方式）",
   "interface": {
     "displayName": "Kimi 用量统计",
