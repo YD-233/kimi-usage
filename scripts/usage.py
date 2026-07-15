@@ -66,10 +66,16 @@ def read_hook_stdin():
     try:
         if sys.stdin.isatty():
             return {}
-        r, _, _ = select.select([sys.stdin], [], [], 0.5)
-        if not r:
-            return {}
-        raw = sys.stdin.read().strip()
+        if os.name == "nt":
+            # Windows select() only works on sockets and raises on pipes.
+            # The hook engine always closes stdin after writing the
+            # payload, so a plain read is safe here.
+            raw = sys.stdin.read().strip()
+        else:
+            r, _, _ = select.select([sys.stdin], [], [], 0.5)
+            if not r:
+                return {}
+            raw = sys.stdin.read().strip()
         return json.loads(raw) if raw else {}
     except Exception:
         return {}
@@ -98,12 +104,16 @@ def find_session_dir(session_id, cwd):
                 if os.path.isdir(d):
                     return d
     # 3. fallback: newest session whose workDir == cwd
+    def norm(p):
+        return os.path.normcase(os.path.normpath(p)) if p else p
+
+    cwd_norm = norm(cwd)
     best, best_mtime = None, -1.0
     for state in glob.glob(os.path.join(home, "sessions", "*", "*",
                                         "state.json")):
         try:
             with open(state, encoding="utf-8") as f:
-                if cwd and json.load(f).get("workDir") != cwd:
+                if cwd_norm and norm(json.load(f).get("workDir")) != cwd_norm:
                     continue
             mtime = os.path.getmtime(state)
         except (OSError, json.JSONDecodeError):
