@@ -257,7 +257,12 @@ def set_terminal_title(text):
     safe = "".join(ch for ch in text if ch.isprintable())
     seq = f"\x1b]0;{safe}\x07"
     debug = os.environ.get("KIMI_USAGE_DEBUG")
-    candidates = [find_ancestor_tty(), "/dev/tty"]
+    if os.name == "nt":
+        # Windows: no /dev/tty, but the console output stream is CONOUT$.
+        # Windows Terminal, Warp and modern conhost all parse OSC 0.
+        candidates = ["CONOUT$"]
+    else:
+        candidates = [find_ancestor_tty(), "/dev/tty"]
     for path in dict.fromkeys(c for c in candidates if c):
         try:
             with open(path, "w", encoding="utf-8", errors="ignore") as tty:

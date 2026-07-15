@@ -1,59 +1,95 @@
 # kimi-usage
 
-[Kimi Code CLI](https://www.kimi.com/code/docs/kimi-code-cli/) 插件：每轮对话结束时，把本轮 token 用量、缓存命中率、会话累计写进**终端标题栏**。
+**[Kimi Code CLI](https://www.kimi.com/code/docs/kimi-code-cli/) 插件：把每轮 token 用量显示在终端标题栏。**
+
+> 标题栏只是**过渡方案**。目前 kimi-code 没有任何能在不污染模型上下文的前提下显示自定义文本的渠道，标题栏是唯一可行解。等官方支持 statusLine（[MoonshotAI/kimi-code#1171](https://github.com/MoonshotAI/kimi-code/issues/1171)）或其他显示能力后，本插件会迁移到更合适的显示方式，详见[后续计划](#后续计划)。
+
+每轮对话结束时，插件会把本轮 token 用量、缓存命中率和会话累计写入终端标题：
 
 ```
-📊 本轮 ↑1.26M/↓8.4k · 缓存 99% · 累计 ↑19.15M/↓115.8k | 当前会话标题
+📊 turn ↑1.26M/↓8.4k · cache 99% · total ↑19.15M/↓115.8k | 我的会话标题
 ```
 
-- **零上下文污染**：统计信息完全不进入模型上下文
-- **轮末即时**：Stop hook 在本轮结束时触发，时机精确
-- **零依赖**：Python 3.7+ 标准库，单文件脚本
+- **零上下文消耗** —— 不会有任何内容被注入模型上下文
+- **精确到轮末** —— 由 `Stop` hook 驱动，模型结束本轮的瞬间触发
+- **零依赖** —— 单个 Python 3.7+ 标准库脚本
 
 ## 安装
 
+在 Kimi Code CLI 的 TUI 中：
+
 ```
-/plugins install <本仓库路径或 URL>
+/plugins install https://github.com/YD-233/kimi-usage
 /reload
 ```
 
-之后每轮对话结束，终端标题自动更新。卸载：`/plugins remove kimi-usage`。
+之后每轮结束标题自动更新。卸载：`/plugins remove kimi-usage`。
+指定版本：`/plugins install https://github.com/YD-233/kimi-usage/releases/tag/v1.0.0`。
 
-> 已知限制：TUI 在会话切换、会话改名、`/reload` 时会重置标题，下一轮结束后会重新写入。
-> 平台支持：Linux 已验证（hook 子进程经 setsid 失去控制终端，脚本通过 `/proc`
-> 向上查找到 TUI 进程的 `/dev/pts/N`）；macOS / Windows 未测试，欢迎 PR。
+## 工作原理
 
-## 原理
+- Kimi Code 的 `Stop` hook 在模型结束一轮时触发，而 hook 引擎会**丢弃**它的 stdout。插件反其道而行之：命令照跑，但任何东西都不可能进入模型上下文。
+- 脚本直接向终端写入 OSC 0 转义序列。转义序列不打印字符、不移动光标，因此不影响 TUI 的差分渲染。
+- 用量数据来自 `~/.kimi-code/sessions/<工作目录>/<会话>/agents/*/wire.jsonl` 中的 `usage.record` 记录（每次 LLM 调用一条；轮边界由 `turn.prompt` 划分）。子 agent 的用量按时间戳归属到对应的轮。
 
-- Kimi Code 的 Stop hook 在模型结束本轮时触发，引擎会**丢弃**它的 stdout——本插件反利用这一点：命令照常执行，却没有任何内容进入模型上下文。
-- 脚本向 TUI 进程的控制终端写 OSC 0 转义序列设置标题；转义序列不产生可见字符、不移动光标，不影响 TUI 的差分渲染。
-- 用量数据来自 `~/.kimi-code/sessions/<wd>/<session>/agents/*/wire.jsonl` 中的 `usage.record`（每次 LLM 调用一条），轮次边界由 `turn.prompt` 划分；子 agent 用量按时间窗口归属。
+## 为什么是标题栏，而不是对话界面
 
-## 为什么是标题栏，而不是对话内显示
-
-插件/Hook 体系目前没有任何"在 TUI 里显示自定义文本且不污染上下文"的官方通道
-（statusLine 功能请求 [MoonshotAI/kimi-code#1171](https://github.com/MoonshotAI/kimi-code/issues/1171) 仍开放）。
-以下每个方案都在 kimi-code 0.24.1 源码中验证过：
+目前官方没有任何渠道能在不污染模型上下文的前提下向 TUI 显示自定义文本（statusLine 的需求 [MoonshotAI/kimi-code#1171](https://github.com/MoonshotAI/kimi-code/issues/1171) 仍挂着）。以下每个备选方案都对着 kimi-code 0.24.1 源码验证过：
 
 | 方案 | 问题 |
 | --- | --- |
-| statusLine / 底栏配置 | 不存在。`tui.toml` 只有 theme、editor、notifications 等 5 个配置项 |
-| UserPromptSubmit hook 输出 | 唯一能渲染进 TUI 的 hook 输出，但①时机是**下轮开头**而非轮末；②文本作为 `hook_result` 消息**进入模型上下文**，每轮白烧 token |
-| Stop hook 输出 | 放行时 stdout 被引擎**直接丢弃**；只有"阻断"结果被处理，而阻断会强制模型多跑一步（每轮多一次 LLM 调用） |
-| 其余 14 个 hook 事件 | 全部 fire-and-forget，输出被丢弃 |
-| 插件斜杠命令 | 命令正文只能作为 prompt 发给模型，不能直接执行脚本——报表必然进上下文且消耗 token |
-| `kimi server` 注入消息 | server 是独立进程，与 TUI 不共享活跃会话状态；REST 只有只读 transcript 接口 |
-| 手动追加 `wire.jsonl` | 运行中的 TUI 对该文件只写不读，追加内容要到 resume/replay 才可见 |
-| 直接写 `/dev/tty` 文本行 | TUI（pi-tui）是行内差分渲染，外部写入使光标记账失步，界面必然错位 |
-| 桌面通知 | 可行但转瞬即逝，不适合作为常驻用量面板 |
+| statusLine / 状态栏配置 | 不存在。`tui.toml` 只有 5 个键（主题、编辑器、通知等） |
+| `UserPromptSubmit` hook 输出 | 唯一会在 TUI 渲染的 hook 输出，但 ① 显示时机是**下一轮开头**而非本轮结束；② 文本会作为 `hook_result` 消息追加进模型上下文——每轮都在烧 token |
+| `Stop` hook 输出 | 正常允许时 stdout 被丢弃；只有 *block* 结果会被消费——而 block 会强制模型多跑一步（每轮多一次 LLM 调用） |
+| 其余 14 个 hook 事件 | 全部是 fire-and-forget，输出被丢弃 |
+| 插件斜杠命令 | 命令体只能是发给模型的 prompt——不能直接执行脚本，所以报告必然进入上下文 |
+| `kimi server` 消息注入 | server 是独立进程，不与 TUI 共享会话的实时状态；REST API 对 transcript 只读 |
+| 追加写 `wire.jsonl` | 运行中的 TUI 只写这个文件；追加的记录要等 resume/回放才可见 |
+| 往 `/dev/tty` 写文本行 | TUI（pi-tui）使用行内差分渲染；外部写入会让它的光标记账失步，把界面搞花 |
+| 桌面通知 | 能用，但太短暂，不适合做常驻用量面板 |
 
-标题栏方案因此成为唯一同时满足**零上下文成本 + 轮末即时 + 不干扰 TUI 渲染**的通道：
+标题栏是目前唯一同时满足**零上下文、轮末时机、不破坏 TUI** 三个条件的渠道：
 
-- Stop hook 的输出反正被丢弃——脚本自己向终端写 OSC 0 转义序列，不产生任何上下文；
-- Stop 事件恰好在模型结束本轮时触发，时机精确；
-- 转义序列不输出可见字符、不移动光标，差分渲染的光标记账不受影响；
-- hook 子进程经 `setsid` 失去控制终端（`/dev/tty` 不可用），脚本改为从 `/proc`
-  沿父进程链找到 TUI 进程的控制终端 `/dev/pts/N`。
+- `Stop` hook 的输出反正被丢弃——脚本自己写 OSC 0 序列，产生零上下文。
+- `Stop` 恰好在模型结束本轮时触发。
+- 转义序列不输出可见字符、不移动光标，渲染器的记账不受影响。
+- hook 子进程被 `setsid` 丢了控制终端（所以 `/dev/tty` 不可用）；脚本沿 `/proc` 的父进程链找到 TUI 进程真正的 `/dev/pts/N`。Windows 上则改写 `CONOUT$`。
+
+## 后续计划
+
+标题栏显示是现阶段的权宜之计，不是最终形态。kimi-code 还在快速迭代，一旦官方提供以下任一能力，插件会第一时间迁移显示方式：
+
+- **statusLine / 状态栏**（[MoonshotAI/kimi-code#1171](https://github.com/MoonshotAI/kimi-code/issues/1171)）——最理想的形态，常驻 TUI 底部
+- 其他不进入模型上下文的展示渠道，例如 hook 输出可选择不注入上下文、插件自定义 UI 面板等
+
+迁移后标题栏写入会保留为可选的兜底方式（比如在 ssh、tmux 等场景下仍然有用）。
+
+## 平台支持
+
+| 平台 | 状态 |
+| --- | --- |
+| Linux | 已验证（GNOME Terminal；理论上任何支持 OSC 标题的终端都行） |
+| Windows | 通过 `CONOUT$` 支持（Windows Terminal、Warp、新版 conhost）——欢迎反馈 |
+| macOS | 未测试——有 `/dev/tty` 兜底；欢迎 PR |
+
+已知限制：TUI 在切换会话、会话改名、`/reload` 时会重置标题；下一轮结束时会写回。
+
+### 排查问题
+
+如果标题没有变化，手动跑一次 hook 并打开调试输出：
+
+```sh
+# Linux / macOS
+echo '{"hook_event_name":"Stop","cwd":"'"$PWD"'"}' | KIMI_USAGE_DEBUG=1 python3 ~/.kimi-code/plugins/managed/kimi-usage/scripts/usage.py
+```
+
+```cmd
+:: Windows（在你的项目目录下运行）
+set KIMI_USAGE_DEBUG=1
+echo {"hook_event_name":"Stop","cwd":"%CD%"} | python3 %USERPROFILE%\.kimi-code\plugins\managed\kimi-usage\scripts\usage.py
+```
+
+调试输出会显示写入了哪个终端目标（或每个候选为什么失败）。如果命令本身跑不起来，请安装 Python 3 或确认 `python3`/`python` 在 `PATH` 上。
 
 ## License
 

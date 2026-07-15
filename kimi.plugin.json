@@ -1,15 +1,15 @@
 {
   "name": "kimi-usage",
   "version": "1.0.0",
-  "description": "Show per-turn token usage and cache hit rate in the terminal title bar",
+  "description": "在终端标题栏显示每轮 token 用量与缓存命中率（标题栏为过渡方案，待 kimi-code 官方支持 statusLine 后迁移显示方式）",
   "interface": {
-    "displayName": "Kimi Usage Meter",
-    "shortDescription": "Per-turn token / cache hit stats in the terminal title"
+    "displayName": "Kimi 用量统计",
+    "shortDescription": "每轮 token / 缓存命中统计，暂显示于终端标题栏"
   },
   "hooks": [
     {
       "event": "Stop",
-      "command": "python3 ./scripts/usage.py",
+      "command": "python3 ./scripts/usage.py || python ./scripts/usage.py",
       "timeout": 10
     }
   ]
