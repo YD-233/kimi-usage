@@ -17,6 +17,7 @@ import glob
 import json
 import os
 import select
+import subprocess
 import sys
 
 
@@ -226,9 +227,17 @@ def find_ancestor_tty():
     """Find the controlling terminal of the nearest ancestor that has one.
 
     Hook children are spawned with setsid (Node's detached: true), so they
-    have no controlling terminal and /dev/tty is unavailable. Walk /proc
-    up the parent chain; the first ancestor with a controlling terminal
-    is the kimi TUI (or something closer to the real terminal)."""
+    have no controlling terminal and /dev/tty is unavailable. Walk up the
+    parent chain; the first ancestor with a controlling terminal is the
+    kimi TUI (or something closer to the real terminal). Linux reads
+    /proc; systems without /proc (macOS, *BSD) use ps(1) instead."""
+    if sys.platform.startswith("linux"):
+        return find_ancestor_tty_proc()
+    return find_ancestor_tty_ps()
+
+
+def find_ancestor_tty_proc():
+    """Linux backend: read tty_nr from /proc/<pid>/stat up the chain."""
 
     def stat_fields(pid):
         try:
@@ -256,6 +265,43 @@ def find_ancestor_tty():
         pid = int(fields[1])  # ppid (fields: state ppid pgrp session tty_nr)
         if pid <= 1:
             return None
+    return None
+
+
+def find_ancestor_tty_ps():
+    """ps(1) backend for systems without /proc (macOS, *BSD).
+
+    ps prints the controlling tty as a device name relative to /dev
+    (ttys003 on macOS, pts/0 on Linux), or ?? when there is none."""
+    try:
+        proc = subprocess.run(["ps", "-eo", "pid=,ppid=,tty="],
+                              capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if proc.returncode != 0:
+        return None
+    table = {}
+    for line in proc.stdout.splitlines():
+        parts = line.split()
+        if len(parts) < 3:
+            continue
+        try:
+            pid, ppid = int(parts[0]), int(parts[1])
+        except ValueError:
+            continue
+        table[pid] = (ppid, parts[2])
+
+    pid = os.getppid()
+    for _ in range(16):
+        entry = table.get(pid)
+        if entry is None:
+            return None
+        ppid, tty = entry
+        if tty != "??":
+            return "/dev/" + tty
+        if ppid <= 1:
+            return None
+        pid = ppid
     return None
 
 

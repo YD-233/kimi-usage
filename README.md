@@ -41,6 +41,7 @@
 | 平台 | 状态 |
 | --- | --- |
 | Linux | 已验证（GNOME Terminal；理论上任何支持 OSC 标题的终端都行） |
+| macOS | 已支持（Terminal.app、iTerm2 等支持 OSC 标题的终端；未实机验证，欢迎反馈） |
 | Windows | 已验证（Warp、Windows Terminal；新版 conhost 同理） |
 
 已知限制：
@@ -51,7 +52,7 @@
 ## 工作原理
 
 - Kimi Code 的 `Stop` hook 在模型结束一轮时触发，而 hook 引擎会**丢弃**它的 stdout。插件反其道而行之：命令照跑，但任何东西都不可能进入模型上下文。
-- Linux 上脚本直接向终端写入 OSC 0 转义序列；Windows 上改用 `SetConsoleTitleW` 直接设置控制台标题。两者都不打印可见字符、不移动光标，因此不影响 TUI 的差分渲染。
+- Linux/macOS 上脚本先沿父进程链找到 TUI 的控制终端（Linux 读 `/proc`，macOS 没有 `/proc`，改用 `ps`），再向它写入 OSC 0 转义序列；Windows 上改用 `SetConsoleTitleW` 直接设置控制台标题。三者都不打印可见字符、不移动光标，因此不影响 TUI 的差分渲染。
 - 用量数据来自 `~/.kimi-code/sessions/<工作目录>/<会话>/agents/*/wire.jsonl` 中的 `usage.record` 记录（每次 LLM 调用一条；轮边界由 `turn.prompt` 划分）。子 agent 的用量按时间戳归属到对应的轮。
 
 ## 后续计划
