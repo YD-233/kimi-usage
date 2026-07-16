@@ -41,7 +41,7 @@
 | 平台 | 状态 |
 | --- | --- |
 | Linux | 已验证（GNOME Terminal；理论上任何支持 OSC 标题的终端都行） |
-| macOS | 已支持（Terminal.app、iTerm2 等支持 OSC 标题的终端；未实机验证，欢迎反馈） |
+| macOS | 已验证（支持 OSC 标题的终端均可） |
 | Windows | 已验证（Warp、Windows Terminal；新版 conhost 同理） |
 
 已知限制：
