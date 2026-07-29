@@ -103,10 +103,6 @@ def main():
 
     turns, session_total = parse_session(session_dir)
     turn_usage = last_active_turn(turns)
-    if turn_usage is None and not session_total["output"]:
-        print("")
-        return
-
     line = stats_line(turn_usage, session_total)
     if session_id:
         _save_cache(session_dir, session_id, line)

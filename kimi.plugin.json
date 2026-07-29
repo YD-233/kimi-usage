@@ -1,6 +1,6 @@
 {
   "name": "kimi-usage",
-  "version": "1.2.0",
+  "version": "1.2.1",
   "description": "把每轮 token 用量与缓存命中率显示在 TUI 底部状态栏；kimi-code < 0.30.0 或不支持状态栏的终端仍回退到标题栏",
   "interface": {
     "displayName": "Kimi 用量统计",
