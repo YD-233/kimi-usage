@@ -9,8 +9,10 @@ token usage and cache hit rate.
 Data source:
   <KIMI_CODE_HOME>/sessions/wd_*/session_*/agents/*/wire.jsonl
 
-Fail-open by design: any error prints an empty line, so the TUI falls back
-to its built-in status line layout.
+Fail-open by design: any error prints a fallback indicator so the user can
+see something is wrong, rather than silently falling back to the built-in
+layout. Set KIMI_USAGE_DEBUG=1 to append diagnostics to
+<KIMI_CODE_HOME>/kimi-usage-debug.log.
 """
 
 import glob
@@ -19,6 +21,8 @@ import json
 import os
 import select
 import sys
+import time
+import traceback
 
 from usage import (
     cache_hit_rate,
@@ -31,20 +35,36 @@ from usage import (
 )
 
 
+def _debug(msg):
+    """Append a debug line to a log file if KIMI_USAGE_DEBUG is set."""
+    if not os.environ.get("KIMI_USAGE_DEBUG"):
+        return
+    try:
+        path = os.path.join(kimi_home(), "kimi-usage-debug.log")
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {msg}\n")
+    except Exception:
+        pass
+
+
 def _read_stdin_json(timeout=0.5):
     """Read a JSON object from stdin; return {} on any failure."""
     try:
         if sys.stdin.isatty():
+            _debug("stdin is a tty")
             return {}
         if os.name == "nt":
             raw = sys.stdin.read().strip()
         else:
             r, _, _ = select.select([sys.stdin], [], [], timeout)
             if not r:
+                _debug("stdin select timeout")
                 return {}
             raw = sys.stdin.read().strip()
+        _debug(f"stdin raw length={len(raw)}")
         return json.loads(raw) if raw else {}
-    except Exception:
+    except Exception as e:
+        _debug(f"stdin read failed: {e}")
         return {}
 
 
@@ -71,6 +91,7 @@ def _cached_line(session_dir, session_id):
         with open(_cache_path(session_id), encoding="utf-8") as f:
             c = json.load(f)
         if c.get("mtime") == _max_wire_mtime(session_dir):
+            _debug("cache hit")
             return c.get("line")
     except (OSError, json.JSONDecodeError):
         pass
@@ -87,12 +108,14 @@ def _save_cache(session_dir, session_id, line):
 
 def main():
     payload = _read_stdin_json()
+    _debug(f"payload keys={list(payload.keys())}")
     session_id = payload.get("sessionId")
     cwd = payload.get("cwd") or os.getcwd()
 
     session_dir = find_session_dir(session_id, cwd)
+    _debug(f"session_id={session_id!r} cwd={cwd!r} session_dir={session_dir!r}")
     if not session_dir:
-        print("")
+        print("kimi-usage: 未定位会话")
         return
 
     if session_id:
@@ -104,6 +127,7 @@ def main():
     turns, session_total = parse_session(session_dir)
     turn_usage = last_active_turn(turns)
     line = stats_line(turn_usage, session_total)
+    _debug(f"line={line!r}")
     if session_id:
         _save_cache(session_dir, session_id, line)
     print(line)
@@ -112,6 +136,7 @@ def main():
 if __name__ == "__main__":
     try:
         main()
-    except Exception:
-        print("")
+    except Exception as e:
+        _debug(f"exception: {e}\n{traceback.format_exc()}")
+        print("kimi-usage: 错误")
     sys.exit(0)

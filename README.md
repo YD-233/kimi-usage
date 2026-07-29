@@ -63,7 +63,7 @@ command = "python3 ~/.kimi-code/plugins/managed/kimi-usage/scripts/statusline.py
 ### 常用命令
 
 - 卸载：`/plugins remove kimi-usage`
-- 指定版本：`/plugins install https://github.com/YD-233/kimi-usage/releases/tag/v1.2.1`
+- 指定版本：`/plugins install https://github.com/YD-233/kimi-usage/releases/tag/v1.2.2`
 
 ## 平台支持
 
