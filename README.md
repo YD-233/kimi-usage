@@ -1,40 +1,35 @@
 # kimi-usage
 
-**[Kimi Code CLI](https://github.com/MoonshotAI/kimi-code) 插件：把每轮 token 用量与缓存命中率显示在 TUI 底部状态栏。**
+**[Kimi Code CLI](https://github.com/MoonshotAI/kimi-code) 插件：把当前会话的 token 用量显示在 TUI 底部状态栏。**
 
-kimi-code 0.30.0+ 开始支持 `[status_line].command` 自定义底部状态栏（[#0.30.0](https://github.com/MoonshotAI/kimi-code/releases/tag/%40moonshot-ai%2Fkimi-code%400.30.0)）。插件提供一个状态栏命令 `scripts/statusline.py`，每秒从会话的 `wire.jsonl` 中汇总出当前轮的 token 用量、缓存命中率和会话累计：
+kimi-code 0.30.0+ 支持 `[status_line].command` 自定义底部状态栏（[#0.30.0](https://github.com/MoonshotAI/kimi-code/releases/tag/%40moonshot-ai%2Fkimi-code%400.30.0)）。插件提供一个状态栏命令 `scripts/statusline.py`，每秒从会话的 `wire.jsonl` 中汇总：
 
-```
-本轮 ↑ 1.26M ↓ 8.4k · 缓存 99% · 总计 ↑ 19.15M ↓ 115.8k
-```
-
-旧版 kimi-code 或不支持状态栏的终端会自动回退到原来的**终端标题栏**显示：
+- 当前会话的**总输入、总输出、缓存命中率**（主 agent + 全部子 agent）
+- 存在子 agent 时，按**模型**分列的子 agent 总输入、总输出、缓存命中率
 
 ```
-本轮 ↑ 1.26M ↓ 8.4k · 缓存 99% · 总计 ↑ 19.15M ↓ 115.8k | 会话标题
+主模型：K3-256k | 总计：↑ 91.04M tok · ↓ 508.5k tok 缓存 99% | DeepSeek V4 Flash ↑ 87.60M tok · ↓ 457.1k tok 缓存 99% | K3-256k ↑ 117.5k tok · ↓ 1.0k tok 缓存 4%
 ```
 
-## 效果预览
+行首是 TUI 快照自带的当前模型（映射为 `display_name`），替代被覆盖的内置栏信息；之后是用量统计。没有子 agent 时只显示会话总计：
 
-| Windows Terminal（标题栏兜底） | Warp（标题栏兜底） | Linux（标题栏兜底） |
-| --- | --- | --- |
-| ![Windows Terminal](images/Windows-terminal.png) | ![Warp](images/Windows-warp.png) | ![GNOME Terminal](images/fedora.png) |
+```
+主模型：K3-256k | 总计：↑ 396.0k tok · ↓ 13.0k tok 缓存 82%
+```
 
-> 状态栏方式不再需要终端支持 OSC 标题，任何能跑 kimi-code TUI 的平台都可以使用。
+> 模型名优先取 `config.toml` 里 `[models."<别名>"]` 的 `display_name`，未配置时回退为别名最后一段。
 
 ## 特性
 
 - **零上下文消耗** —— 不会向模型上下文注入任何内容
-- **实时更新** —— 状态栏每秒刷新一次，轮末瞬间即可看到最新数据
-- **精确到轮** —— 用量按 `turn.prompt` 划分的轮边界统计，子 agent 用量按时间戳归属
-- **跨平台** —— Linux / macOS / Windows 均可使用状态栏方式
+- **实时更新** —— 状态栏每秒刷新一次，模型每次调用后立即可见
+- **按模型分列** —— 子 agent 用量按 `usage.record` 里的模型别名聚合，并显示 `config.toml` 中配置的 `display_name`，多模型混跑一目了然
+- **跨平台** —— Linux / macOS / Windows 均可使用
 - **零依赖** —— 单个 Python 3.7+ 标准库脚本
 
 ## 安装
 
-前置条件：系统已安装 Python 3.7+，且 `python` 或 `python3` 在 `PATH` 上。
-
-### 1. 安装插件
+前置条件：kimi-code ≥ 0.30.0，系统已安装 Python 3.7+，且 `python` 或 `python3` 在 `PATH` 上。
 
 在 Kimi Code CLI 的 TUI 中：
 
@@ -43,46 +38,30 @@ kimi-code 0.30.0+ 开始支持 `[status_line].command` 自定义底部状态栏�
 /reload
 ```
 
-### 2. 配置状态栏命令
+之后新开一个会话（`/new`）或重启 CLI，插件的 `SessionStart` hook 会自动把 `[status_line].command` 写入 `~/.kimi-code/tui.toml`（带 `# >>> kimi-usage` 标记块，指向当前解释器与插件目录的绝对路径，可重复执行、不会写重）。执行 `/reload-tui` 或再等一次启动，底部状态栏即开始显示用量。
 
-kimi-code 0.30.0+ 需要在 `~/.kimi-code/tui.toml` 里启用 `[status_line]` 命令。打开该文件，加入：
+说明：
 
-```toml
-[status_line]
-command = "python3 ~/.kimi-code/plugins/managed/kimi-usage/scripts/statusline.py || python ~/.kimi-code/plugins/managed/kimi-usage/scripts/statusline.py"
-```
-
-> 如果修改过 `KIMI_CODE_HOME` 环境变量，请将 `~/.kimi-code` 替换为实际的数据目录；Windows 上默认对应 `%USERPROFILE%\.kimi-code`。
-
-保存后执行 `/reload-tui`（只重载界面配置）或 `/reload`（同时重载其他配置），底部状态栏即开始显示用量。
-
-### 3. 旧版兜底
-
-如果你用的是 kimi-code 0.29.x 或更早版本，插件会自动通过 `Stop` hook 把用量写入终端标题栏，无需配置 `tui.toml`。
+- 如果你的 `tui.toml` 里已经有自己配置的 `[status_line]` 段，插件**不会覆盖**；想用本插件，把该段的 `command` 删掉或改成指向 `plugins/managed/kimi-usage/scripts/statusline.py` 即可。
+- 想恢复内置状态栏：禁用插件（`/plugins` 里空格键），或删掉 `tui.toml` 里两条 `# >>> / # <<< kimi-usage` 标记之间的块。
+- 卸载 `/plugins remove kimi-usage` 只删安装记录，managed 副本和 `tui.toml` 标记块会保留（状态栏仍可工作）；要彻底清掉就按上一条删标记块。
 
 ### 常用命令
 
 - 卸载：`/plugins remove kimi-usage`
-- 指定版本：`/plugins install https://github.com/YD-233/kimi-usage/releases/tag/v1.2.2`
+- 指定版本：`/plugins install https://github.com/YD-233/kimi-usage/releases/tag/v1.4.0`
 
 ## 平台支持
 
-| 平台 | 状态栏 | 标题栏兜底 |
-| --- | --- | --- |
-| Linux | 支持（kimi-code ≥ 0.30.0） | 已验证（GNOME Terminal 等支持 OSC 标题的终端） |
-| macOS | 支持（kimi-code ≥ 0.30.0） | 已验证（支持 OSC 标题的终端均可） |
-| Windows | 支持（kimi-code ≥ 0.30.0） | 已验证（Windows Terminal、Warp；新版 conhost 同理） |
-
-已知限制：
-
-- 标题栏兜底模式下，TUI 在切换会话、会话改名、`/reload` 时会重置标题；下一轮结束时会写回。
-- 标题栏兜底要求终端能显示标题变化。Windows 上 mintty（Git Bash 默认终端）不走 conhost，无法显示标题——请使用 Windows Terminal、Warp 等现代终端。
+任何能运行 kimi-code ≥ 0.30.0 TUI 的平台均可使用（Linux / macOS / Windows 已验证）。状态栏命令失败时 TUI 会静默回退到内置布局，用下面的调试方法排查。
 
 ## 工作原理
 
-- **状态栏方式**：kimi-code 0.30.0+ 每秒把当前会话快照（`sessionId`、`cwd`、上下文用量等）以 JSON 形式通过 stdin 喂给 `[status_line].command`。`scripts/statusline.py` 根据 `sessionId` 定位到 `~/.kimi-code/sessions/<工作目录>/<会话>/agents/*/wire.jsonl`，汇总 `usage.record` 记录后输出一行用量文本。TUI 取 stdout 第一行显示在底部。脚本含有一个轻量缓存，按 `wire.jsonl` 修改时间失效，避免每秒重复解析大文件。
-- **标题栏兜底**：每轮结束时 `Stop` hook 触发 `scripts/usage.py`，它同样解析 `wire.jsonl`，但通过 OSC 0（Linux/macOS）或 `SetConsoleTitleW`（Windows）把结果写入终端标题。stdout 被 hook 引擎丢弃，因此**不会进入模型上下文**。
-- 用量数据来自 `wire.jsonl` 中的 `usage.record` 记录（每次 LLM 调用一条；轮边界由 `turn.prompt` 划分）。子 agent 的用量按时间戳归属到对应的轮。
+- 插件 manifest 无法直接声明状态栏命令，因此用 `SessionStart` hook 运行 `scripts/setup_statusline.py`，把 `[status_line].command` 幂等写入 `~/.kimi-code/tui.toml`；hook 不产生任何 stdout，零上下文消耗。Windows 下 TUI 经 `cmd /d /s /c` 启动命令，内层引号会被 Node/libuv 转义成 cmd 无法识别的 `\"`，因此自动配置在 Windows 上会把解释器和脚本路径转成 8.3 短路径后**不加引号**写入（手动配置时请保持同样写法，或用 `dir /x` 查短路径）。
+- kimi-code 每秒把当前会话快照（`sessionId`、`cwd`、模型、上下文用量等）以 JSON 形式通过 stdin 喂给 `[status_line].command`，脚本取 stdout 第一行渲染到底部状态栏。
+- `scripts/statusline.py` 根据 `sessionId` 定位到 `~/.kimi-code/sessions/<工作目录>/<会话>/agents/*/wire.jsonl`，汇总其中每次 LLM 调用产生的 `usage.record` 记录（含模型别名），输出一行用量文本。
+- 脚本带一个轻量缓存，按 `wire.jsonl` 修改时间失效，避免每秒重复解析大文件；解析时只对含 `usage.record` 的行做 JSON 解码，多 MB 的 wire 文件冷解析也在 300ms 的状态栏时限内。
+- 用量口径：总输入 = `inputOther + inputCacheRead + inputCacheCreation`；缓存命中率 = `inputCacheRead / 总输入`。
 
 ## 调试
 
@@ -94,11 +73,7 @@ printf '{"sessionId":"YOUR_SESSION_ID","cwd":"/your/project"}' | \
   python3 ~/.kimi-code/plugins/managed/kimi-usage/scripts/statusline.py
 ```
 
-标题栏兜底模式可用 `KIMI_USAGE_DEBUG=1` 查看写到了哪个设备：
-
-```bash
-KIMI_USAGE_DEBUG=1 kimi
-```
+也可用 `KIMI_USAGE_DEBUG=1` 让脚本把诊断信息追加到 `~/.kimi-code/kimi-usage-debug.log`。
 
 ## License
 

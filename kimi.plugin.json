@@ -1,15 +1,15 @@
 {
   "name": "kimi-usage",
-  "version": "1.2.2",
-  "description": "把每轮 token 用量与缓存命中率显示在 TUI 底部状态栏；kimi-code < 0.30.0 或不支持状态栏的终端仍回退到标题栏",
+  "version": "1.4.0",
+  "description": "在 TUI 底部状态栏显示当前会话的 token 总输入、总输出与缓存命中率，并按模型汇总子 Agent 用量；安装后自动配置状态栏，无需手改 tui.toml（需要 kimi-code ≥ 0.30.0）",
   "interface": {
     "displayName": "Kimi 用量统计",
-    "shortDescription": "每轮 token / 缓存命中统计，默认显示于 TUI 底部状态栏"
+    "shortDescription": "会话 token 总输入/总输出/缓存命中率，子 Agent 按模型分列，显示于 TUI 底部状态栏"
   },
   "hooks": [
     {
-      "event": "Stop",
-      "command": "python3 ./scripts/usage.py || python ./scripts/usage.py",
+      "event": "SessionStart",
+      "command": "python3 ./scripts/setup_statusline.py || python ./scripts/setup_statusline.py",
       "timeout": 10
     }
   ]
