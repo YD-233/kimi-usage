@@ -11,6 +11,13 @@ Data source:
   <KIMI_CODE_HOME>/sessions/wd_*/session_*/agents/*/wire.jsonl
   (usage.record entries; each carries a "model" field)
 
+The line is fitted to the live terminal width (queried from the console,
+not the snapshot, which has no width field), degrading cheapest losses
+first: the unit shrinks "token" -> "tok" -> dropped, the git branch and
+cwd leave the prefix, the "总计："/"缓存" labels drop, " · " tightens,
+sub-agent columns fall from the smallest consumer, and only as a last
+resort the line is cut with an ellipsis.
+
 Fail-open by design: any error prints a fallback indicator so the user can
 see something is wrong, rather than silently falling back to the built-in
 layout. Set KIMI_USAGE_DEBUG=1 to append diagnostics to
@@ -26,6 +33,7 @@ import sys
 import threading
 import time
 import traceback
+import unicodedata
 
 
 def kimi_home():
@@ -387,15 +395,25 @@ def _cache_sgr(rate):
     return "38;2;%d;%d;%d" % rgb
 
 
-def stats_line(session_total, sub_by_model, display_names):
+def stats_line(session_total, sub_by_model, display_names,
+               unit="token", total_label=True, cache_label=True,
+               dot_spaces=True, max_subs=None):
     """Session totals first, then per-model sub-agent usage, so the most
     important info survives narrow terminals. Input is painted blue,
     output magenta, and the cache rate on a red->green ramp. At 95%+ the
-    rate keeps one decimal (95.3%); only a true 100% stays an integer."""
+    rate keeps one decimal (95.3%); only a true 100% stays an integer.
+
+    Compaction knobs (used by _fit_line to degrade gracefully): unit is
+    the token-unit suffix ("token" -> "tok" -> ""), total_label drops
+    "总计：", cache_label drops the "缓存" label keeping the colored
+    percent, dot_spaces tightens " · " to "·", and max_subs caps how
+    many sub-agent columns are appended (they are sorted by input
+    tokens, so a cap drops the smallest consumers first)."""
     def seg(u):
-        s = (_paint(f"↑ {fmt_tokens(input_total(u))} tok", "34")
-             + _paint(" · ", "2")
-             + _paint(f"↓ {fmt_tokens(u['output'])} tok", "35"))
+        suffix = f" {unit}" if unit else ""
+        s = (_paint(f"↑ {fmt_tokens(input_total(u))}{suffix}", "34")
+             + _paint(" · " if dot_spaces else "·", "2")
+             + _paint(f"↓ {fmt_tokens(u['output'])}{suffix}", "35"))
         r = cache_hit_rate(u)
         if r is not None:
             if r >= 100:
@@ -404,10 +422,11 @@ def stats_line(session_total, sub_by_model, display_names):
                 text = f"{min(r, 99.9):.1f}%"
             else:
                 text = f"{round(r)}%"
-            s += _paint(f" 缓存 {text}", _cache_sgr(r))
+            s += _paint((" 缓存 " if cache_label else " ") + text,
+                        _cache_sgr(r))
         return s
 
-    line = "总计：" + seg(session_total)
+    line = ("总计：" if total_label else "") + seg(session_total)
     subs = []
     for model, u in sorted(sub_by_model.items(),
                            key=lambda kv: input_total(kv[1]),
@@ -416,9 +435,163 @@ def stats_line(session_total, sub_by_model, display_names):
             continue
         name = display_names.get(model) or short_model(model)
         subs.append(f"{name} {seg(u)}")
+    if max_subs is not None:
+        subs = subs[:max_subs]
     if subs:
         line += " | " + " | ".join(subs)
     return line
+
+
+# --------------------------------------------------------------------------
+# width detection and graceful degradation
+# --------------------------------------------------------------------------
+
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+
+
+def _visible_len(s):
+    """Terminal column count of a rendered line: ANSI escapes ignored,
+    East Asian wide/fullwidth chars (总计, 缓存, …) count 2."""
+    plain = _ANSI_RE.sub("", s)
+    return sum(2 if unicodedata.east_asian_width(ch) in "WF" else 1
+               for ch in plain)
+
+
+def _truncate(s, width):
+    """Hard-cut a rendered line to `width` columns with an ellipsis,
+    keeping ANSI escapes intact and appending a reset so the TUI's own
+    painting is not poisoned."""
+    out, used, i = [], 0, 0
+    while i < len(s):
+        m = _ANSI_RE.match(s, i)
+        if m:
+            out.append(m.group(0))
+            i = m.end()
+            continue
+        ch = s[i]
+        w = 2 if unicodedata.east_asian_width(ch) in "WF" else 1
+        if used + w > width - 1:
+            break
+        out.append(ch)
+        used += w
+        i += 1
+    out.append("…")
+    if _colors_on():
+        out.append("\x1b[0m")
+    return "".join(out)
+
+
+def _terminal_width(payload):
+    """Best-effort width of the terminal the TUI is running in.
+
+    The TUI snapshot carries no width field (checked against kimi-code
+    0.30 docs) and stdout is a pipe, so the console is queried directly:
+    CONOUT$ on Windows (the spawned command inherits the TUI's console),
+    /dev/tty on POSIX. Returns None when undetectable — the caller then
+    emits the full line and lets the TUI truncate as before."""
+    for key in ("width", "terminalWidth", "cols"):
+        w = payload.get(key)
+        if isinstance(w, int) and not isinstance(w, bool) and w > 0:
+            return w
+    if os.name == "nt":
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            class _CSBI(ctypes.Structure):
+                _fields_ = [("dwSize", wintypes._COORD),
+                            ("dwCursorPosition", wintypes._COORD),
+                            ("wAttributes", wintypes.WORD),
+                            ("srWindow", wintypes.SMALL_RECT),
+                            ("dwMaximumWindowSize", wintypes._COORD)]
+
+            h = ctypes.windll.kernel32.CreateFileW(
+                "CONOUT$", 0xC0000000, 3, None, 3, 0, None)
+            if h and h != -1:
+                info = _CSBI()
+                try:
+                    if ctypes.windll.kernel32.GetConsoleScreenBufferInfo(
+                            h, ctypes.byref(info)):
+                        w = info.srWindow.Right - info.srWindow.Left + 1
+                        if w > 0:
+                            return w
+                finally:
+                    ctypes.windll.kernel32.CloseHandle(h)
+        except Exception:
+            pass
+    else:
+        try:
+            fd = os.open("/dev/tty", os.O_RDONLY)
+            try:
+                w = os.get_terminal_size(fd).columns
+                if w > 0:
+                    return w
+            finally:
+                os.close(fd)
+        except OSError:
+            pass
+    try:
+        w = int(os.environ.get("COLUMNS", ""))
+        if w > 0:
+            return w
+    except ValueError:
+        pass
+    return None
+
+
+def _fit_line(payload, session_total, sub_by_model, display_names,
+              swarm_on, effort, width):
+    """Render prefix + stats to fit `width` columns by graceful
+    degradation, cheapest losses first: unit "token" -> "tok" ->
+    dropped, git branch dropped, cwd dropped, the "总计：" and "缓存"
+    labels dropped, " · " tightened to "·", then sub-agent columns from
+    the smallest consumer, the whole prefix, and only as a last resort
+    an ellipsis cut. With width=None the full line is returned and the
+    TUI truncates as before."""
+    base = dict(unit="token", total_label=True, cache_label=True,
+                dot_spaces=True, with_cwd=True, with_git=True)
+    # each stage updates cumulatively on top of the previous one
+    stages = [
+        {},                     # full
+        {"unit": "tok"},
+        {"with_git": False},
+        {"with_cwd": False},
+        {"unit": ""},
+        {"total_label": False},
+        {"cache_label": False},
+        {"dot_spaces": False},
+    ]
+
+    def compose(o, max_subs=None, with_prefix=True):
+        usage = stats_line(session_total, sub_by_model, display_names,
+                           unit=o["unit"], total_label=o["total_label"],
+                           cache_label=o["cache_label"],
+                           dot_spaces=o["dot_spaces"], max_subs=max_subs)
+        if not with_prefix:
+            return usage
+        p = prefix_line(payload, display_names, swarm_on, effort,
+                        with_cwd=o["with_cwd"], with_git=o["with_git"])
+        return f"{p} | {usage}" if p else usage
+
+    opts = dict(base)
+    line = compose(opts)
+    if not width or _visible_len(line) <= width:
+        return line
+    for stage in stages[1:]:
+        opts.update(stage)
+        line = compose(opts)
+        if _visible_len(line) <= width:
+            return line
+    n = len(sub_by_model)
+    while n > 0:
+        n -= 1
+        line = compose(opts, max_subs=n)
+        if _visible_len(line) <= width:
+            return line
+    line = compose(opts, max_subs=0, with_prefix=False)
+    if _visible_len(line) <= width:
+        return line
+    return _truncate(line, width)
 
 
 def _colors_on():
@@ -459,12 +632,15 @@ def shorten_cwd(path):
     return "…/" + "/".join(segments[-3:])
 
 
-def prefix_line(payload, display_names, swarm_on, effort):
+def prefix_line(payload, display_names, swarm_on, effort,
+                with_cwd=True, with_git=True):
     """Rebuilt on every run (not cached). Reproduces the built-in footer
     line 1 slots that the TUI snapshot exposes, in the original order and
     spacing (two-space separated): mode badges (bare words, only when
     active), model display_name with thinking-effort suffix, shortened
-    cwd, git branch.
+    cwd, git branch. with_cwd / with_git drop those slots for narrow
+    terminals (cwd is the longest and least load-bearing, so it goes
+    first).
 
     swarm state and effort come from the session wire log (the TUI
     snapshot omits both); goal/tasks badges, rotating tips and git diff
@@ -494,10 +670,10 @@ def prefix_line(payload, display_names, swarm_on, effort):
         elif effort == "on":
             label += " thinking"
         parts.append(label)
-    cwd = shorten_cwd(payload.get("cwd") or "")
+    cwd = shorten_cwd(payload.get("cwd") or "") if with_cwd else ""
     if cwd:
         parts.append(_paint(cwd, "2"))
-    branch = payload.get("gitBranch")
+    branch = payload.get("gitBranch") if with_git else None
     if branch:
         parts.append(_paint(branch, "2"))
     return "  ".join(parts)
@@ -525,23 +701,30 @@ def _cache_path(session_id):
     return os.path.join(base, f"{safe}.json")
 
 
-def _cached_line(session_dir, session_id):
+def _cached_stats(session_dir, session_id):
+    """Return (session_total, sub_by_model, swarm_on, effort) when the
+    wire files are unchanged since the cache write. Raw stats are cached
+    rather than the rendered line: rendering depends on the live terminal
+    width, which can change between runs (window resize)."""
     try:
         with open(_cache_path(session_id), encoding="utf-8") as f:
             c = json.load(f)
-        if c.get("v") == 9 and c.get("mtime") == _max_wire_mtime(session_dir):
+        if c.get("v") == 10 and c.get("mtime") == _max_wire_mtime(session_dir):
             _debug("cache hit")
-            return c.get("line"), bool(c.get("swarm")), c.get("effort")
-    except (OSError, json.JSONDecodeError):
+            return (c["session_total"], c["sub_by_model"],
+                    bool(c.get("swarm")), c.get("effort"))
+    except (OSError, json.JSONDecodeError, KeyError, TypeError):
         pass
     return None
 
 
-def _save_cache(session_dir, session_id, line, swarm_on, effort):
+def _save_cache(session_dir, session_id, session_total, sub_by_model,
+                swarm_on, effort):
     try:
         with open(_cache_path(session_id), "w", encoding="utf-8") as f:
-            json.dump({"v": 9, "mtime": _max_wire_mtime(session_dir),
-                       "line": line, "swarm": swarm_on,
+            json.dump({"v": 10, "mtime": _max_wire_mtime(session_dir),
+                       "session_total": session_total,
+                       "sub_by_model": sub_by_model, "swarm": swarm_on,
                        "effort": effort}, f)
     except OSError:
         pass
@@ -569,22 +752,25 @@ def main():
         print(line)
         return
 
-    cached = _cached_line(session_dir, session_id) if session_id else None
+    cached = _cached_stats(session_dir, session_id) if session_id else None
     if cached is not None:
-        usage_line, swarm_on, effort = cached
+        session_total, sub_by_model, swarm_on, effort = cached
     else:
         session_total, sub_by_model, swarm_on, effort = \
             parse_session(session_dir)
-        usage_line = stats_line(session_total, sub_by_model,
-                                model_display_names())
-        _debug(f"usage_line={usage_line!r} swarm_on={swarm_on} effort={effort!r}")
+        _debug(f"swarm_on={swarm_on} effort={effort!r} "
+               f"sub_models={list(sub_by_model)}")
         if session_id:
-            _save_cache(session_dir, session_id, usage_line, swarm_on,
-                        effort)
+            _save_cache(session_dir, session_id, session_total,
+                        sub_by_model, swarm_on, effort)
 
-    prefix = prefix_line(payload, model_display_names(), swarm_on, effort)
-    line = f"{prefix} | {usage_line}" if prefix else usage_line
-    _debug(f"line={line!r}")
+    # Rendering happens on every run (cache holds raw stats): the line is
+    # fitted to the live terminal width, so a window resize takes effect
+    # on the next refresh instead of after the wire files change.
+    width = _terminal_width(payload)
+    line = _fit_line(payload, session_total, sub_by_model,
+                     model_display_names(), swarm_on, effort, width)
+    _debug(f"width={width} line={line!r}")
     print(line)
 
 
