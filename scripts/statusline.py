@@ -179,10 +179,10 @@ def find_session_dir(session_id, cwd):
 # --------------------------------------------------------------------------
 
 def iter_usage_records(path):
-    """Yield (record_type, record) for lines worth parsing.
+    """Yield (kind, record) for lines worth parsing.
 
     Cheap substring pre-filter keeps this fast on multi-MB wire files:
-    only usage.record and profile.bind lines are JSON-decoded.
+    only usage.record / profile.bind / swarm_mode lines are JSON-decoded.
     """
     try:
         with open(path, encoding="utf-8") as f:
@@ -191,6 +191,8 @@ def iter_usage_records(path):
                     kind = "usage.record"
                 elif '"profile.bind"' in line:
                     kind = "profile.bind"
+                elif '"swarm_mode.' in line:
+                    kind = "swarm"
                 else:
                     continue
                 try:
@@ -202,14 +204,20 @@ def iter_usage_records(path):
 
 
 def parse_session(session_dir):
-    """Return (session_total, sub_by_model).
+    """Return (session_total, sub_by_model, swarm_on, effort).
 
     session_total: usage aggregated over every agent in the session
     (main + sub-agents).
     sub_by_model:  {model: usage} aggregated over sub-agent wires only.
+    swarm_on:      state of the last swarm_mode op persisted in the main
+    wire (swarm mode is a wire Model, so the log is authoritative).
+    effort:        thinkingEffort of the latest profile.bind in the main
+    wire (rebound on every request, so it tracks /effort switches).
     """
     session_total = empty_usage()
     sub_by_model = {}
+    swarm_on = False
+    effort = None
 
     for wire in glob.glob(os.path.join(session_dir, "agents", "*",
                                        "wire.jsonl")):
@@ -217,8 +225,14 @@ def parse_session(session_dir):
         is_main = agent == "main"
         bound_model = None
         for kind, rec in iter_usage_records(wire):
+            if kind == "swarm":
+                if is_main:
+                    swarm_on = rec.get("type") == "swarm_mode.enter"
+                continue
             if kind == "profile.bind":
                 bound_model = rec.get("modelAlias") or bound_model
+                if is_main:
+                    effort = rec.get("thinkingEffort", effort)
                 continue
             u = {k: int(rec.get("usage", {}).get(k, 0) or 0)
                  for k in session_total}
@@ -231,7 +245,7 @@ def parse_session(session_dir):
                 bucket = sub_by_model[model] = empty_usage()
             add_usage(bucket, u)
 
-    return session_total, sub_by_model
+    return session_total, sub_by_model, swarm_on, effort
 
 
 # --------------------------------------------------------------------------
@@ -303,13 +317,86 @@ def stats_line(session_total, sub_by_model, display_names):
     return line
 
 
-def prefix_line(payload, display_names):
-    """The current model (mapped to its display_name), rebuilt on every
-    run rather than cached, since /model switches don't touch wire files."""
+def _colors_on():
+    # TERM=dumb means no color rendering (also what CI/tool harnesses set);
+    # NO_COLOR is deliberately NOT honored — agent shells often export it and
+    # it would silently strip colors from the TUI's status line spawns too.
+    return (os.environ.get("TERM", "") != "dumb"
+            and not os.environ.get("KIMI_USAGE_NO_COLOR"))
+
+
+def _paint(text, code):
+    """Wrap text in an ANSI SGR escape. The TUI paints the whole custom
+    line in colors.text, so embedded escapes reproduce the built-in
+    footer's per-slot colors: amber bold for auto/yolo, blue bold for
+    plan, dim for cwd/git. Named colors follow the terminal's own palette,
+    which keeps theme="auto" sensible in both dark and light terminals."""
+    if not text or not _colors_on():
+        return text
+    return f"\x1b[{code}m{text}\x1b[0m"
+
+
+def shorten_cwd(path):
+    """Mirror the built-in footer's shortenCwd: '~' for home, otherwise the
+    last 3 segments as '…/a/b/c'."""
+    if not path:
+        return path
+    path = path.replace("\\", "/")
+    home = os.path.expanduser("~").replace("\\", "/")
+    if path == home:
+        return "~"
+    if home:
+        cmp = (lambda p: os.path.normcase(p)) if os.name == "nt" else (lambda p: p)
+        if cmp(path).startswith(cmp(home) + "/"):
+            path = "~" + path[len(home):]
+    segments = [s for s in path.split("/") if s]
+    if len(segments) <= 3:
+        return path
+    return "…/" + "/".join(segments[-3:])
+
+
+def prefix_line(payload, display_names, swarm_on, effort):
+    """Rebuilt on every run (not cached). Reproduces the built-in footer
+    line 1 slots that the TUI snapshot exposes, in the original order and
+    spacing (two-space separated): mode badges (bare words, only when
+    active), model display_name with thinking-effort suffix, shortened
+    cwd, git branch.
+
+    swarm state and effort come from the session wire log (the TUI
+    snapshot omits both); goal/tasks badges, rotating tips and git diff
+    stats are not reproducible."""
+    parts = []
+    modes = []
+    perm = payload.get("permissionMode") or ""
+    if perm == "auto":
+        modes.append(_paint("auto", "33;1"))
+    if perm == "yolo":
+        modes.append(_paint("yolo", "33;1"))
+    if payload.get("planMode"):
+        modes.append(_paint("plan", "34;1"))
+    if swarm_on:
+        modes.append(_paint("swarm", "36;1"))
+    if modes:
+        parts.append(" ".join(modes))
     model = payload.get("model") or ""
     if model:
-        return f"主模型：{display_names.get(model) or short_model(model)}"
-    return ""
+        label = display_names.get(model) or short_model(model)
+        # Mirror the built-in model slot: concrete effort levels render as
+        # "thinking: max", boolean-on legacy models as plain " thinking".
+        if effort is True:
+            label += " thinking"
+        elif effort and effort not in ("off", "on", False):
+            label += f" thinking: {effort}"
+        elif effort == "on":
+            label += " thinking"
+        parts.append(label)
+    cwd = shorten_cwd(payload.get("cwd") or "")
+    if cwd:
+        parts.append(_paint(cwd, "2"))
+    branch = payload.get("gitBranch")
+    if branch:
+        parts.append(_paint(branch, "2"))
+    return "  ".join(parts)
 
 
 # --------------------------------------------------------------------------
@@ -338,19 +425,20 @@ def _cached_line(session_dir, session_id):
     try:
         with open(_cache_path(session_id), encoding="utf-8") as f:
             c = json.load(f)
-        if c.get("v") == 2 and c.get("mtime") == _max_wire_mtime(session_dir):
+        if c.get("v") == 4 and c.get("mtime") == _max_wire_mtime(session_dir):
             _debug("cache hit")
-            return c.get("line")
+            return c.get("line"), bool(c.get("swarm")), c.get("effort")
     except (OSError, json.JSONDecodeError):
         pass
     return None
 
 
-def _save_cache(session_dir, session_id, line):
+def _save_cache(session_dir, session_id, line, swarm_on, effort):
     try:
         with open(_cache_path(session_id), "w", encoding="utf-8") as f:
-            json.dump({"v": 2, "mtime": _max_wire_mtime(session_dir),
-                       "line": line}, f)
+            json.dump({"v": 4, "mtime": _max_wire_mtime(session_dir),
+                       "line": line, "swarm": swarm_on,
+                       "effort": effort}, f)
     except OSError:
         pass
 
@@ -368,18 +456,20 @@ def main():
         print("kimi-usage: 未定位会话")
         return
 
-    usage_line = None
-    if session_id:
-        usage_line = _cached_line(session_dir, session_id)
-    if usage_line is None:
-        session_total, sub_by_model = parse_session(session_dir)
+    cached = _cached_line(session_dir, session_id) if session_id else None
+    if cached is not None:
+        usage_line, swarm_on, effort = cached
+    else:
+        session_total, sub_by_model, swarm_on, effort = \
+            parse_session(session_dir)
         usage_line = stats_line(session_total, sub_by_model,
                                 model_display_names())
-        _debug(f"usage_line={usage_line!r}")
+        _debug(f"usage_line={usage_line!r} swarm_on={swarm_on} effort={effort!r}")
         if session_id:
-            _save_cache(session_dir, session_id, usage_line)
+            _save_cache(session_dir, session_id, usage_line, swarm_on,
+                        effort)
 
-    prefix = prefix_line(payload, model_display_names())
+    prefix = prefix_line(payload, model_display_names(), swarm_on, effort)
     line = f"{prefix} | {usage_line}" if prefix else usage_line
     _debug(f"line={line!r}")
     print(line)

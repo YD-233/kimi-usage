@@ -8,13 +8,13 @@ kimi-code 0.30.0+ 支持 `[status_line].command` 自定义底部状态栏（[#0.
 - 存在子 agent 时，按**模型**分列的子 agent 总输入、总输出、缓存命中率
 
 ```
-主模型：K3-256k | 总计：↑ 91.04M tok · ↓ 508.5k tok 缓存 99% | DeepSeek V4 Flash ↑ 87.60M tok · ↓ 457.1k tok 缓存 99% | K3-256k ↑ 117.5k tok · ↓ 1.0k tok 缓存 4%
+yolo plan  K3-256k  D:/project/kimi-usage  main | 总计：↑ 91.04M tok · ↓ 508.5k tok 缓存 99% | DeepSeek V4 Flash ↑ 87.60M tok · ↓ 457.1k tok 缓存 99% | K3-256k ↑ 117.5k tok · ↓ 1.0k tok 缓存 4%
 ```
 
-行首是 TUI 快照自带的当前模型（映射为 `display_name`），替代被覆盖的内置栏信息；之后是用量统计。没有子 agent 时只显示会话总计：
+`|` 左侧复刻内置栏第 1 行：模式徽标（`yolo`/`auto` 琥珀色加粗、`plan` 蓝色加粗、`swarm` 青色加粗，仅激活时显示）、当前模型（取 `display_name`，带 `thinking: max` 思考强度后缀）、缩短后的工作目录与 git 分支（暗色），槽位间两个空格，配色与官方样式一致（用终端命名色，深浅主题都正常；设 `KIMI_USAGE_NO_COLOR=1` 可关掉）。swarm 状态与思考强度不在 TUI 快照里，但 `swarm_mode.enter/exit` 和 `profile.bind`（带 thinkingEffort）都会持久化到会话 wire 日志，插件从日志取最后一条为准。（仍无法复刻的：goal/后台任务徽标、git 增删行数、右侧轮换小提示；内置栏第 2 行的 `context: N%` 不受影响。）没有子 agent 时只显示会话总计：
 
 ```
-主模型：K3-256k | 总计：↑ 396.0k tok · ↓ 13.0k tok 缓存 82%
+K3-256k  D:/project/kimi-usage  main | 总计：↑ 396.0k tok · ↓ 13.0k tok 缓存 82%
 ```
 
 > 模型名优先取 `config.toml` 里 `[models."<别名>"]` 的 `display_name`，未配置时回退为别名最后一段。
