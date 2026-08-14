@@ -563,7 +563,7 @@ def main():
         # default_effort from config.toml since there is no wire log.
         effort = model_default_efforts().get(payload.get("model") or "")
         prefix = prefix_line(payload, model_display_names(), False, effort)
-        note = "kimi-usage: 未定位会话"
+        note = _paint("开启对话以显示上下文情况", "2")
         line = f"{prefix} | {note}" if prefix else note
         _debug(f"line={line!r}")
         print(line)
