@@ -59,10 +59,13 @@ def add_usage(acc, u):
 
 
 def cache_hit_rate(u):
+    """Cache hit rate as a float percent (None when no input yet). Kept
+    unrounded: modern providers sit at 95%+ almost always, so the display
+    and the color ramp both need sub-percent resolution up there."""
     total = input_total(u)
     if total <= 0:
         return None
-    return round(u["inputCacheRead"] / total * 100)
+    return u["inputCacheRead"] / total * 100
 
 
 def _debug(msg):
@@ -292,15 +295,116 @@ def model_display_names():
     return names
 
 
+def model_default_efforts():
+    """alias -> default_effort, scanned from the [models] table in
+    config.toml. Used as the thinking-effort fallback when the session
+    wire log is not available yet (e.g. a brand-new conversation whose
+    session directory has not been located)."""
+    header = re.compile(
+        r'^\s*\[\s*models\.\s*(?:"([^"]+)"|([A-Za-z0-9_\-]+))'
+        r'(\s*\.\s*overrides\s*)?\]\s*$')
+    eff = re.compile(r'^\s*default_effort\s*=\s*"([^"]+)"')
+    names, overrides = {}, {}
+    current, is_override = None, False
+    try:
+        with open(os.path.join(kimi_home(), "config.toml"),
+                  encoding="utf-8") as f:
+            for line in f:
+                m = header.match(line)
+                if m:
+                    current = m.group(1) or m.group(2)
+                    is_override = bool(m.group(3))
+                    continue
+                if line.lstrip().startswith("["):
+                    current, is_override = None, False
+                    continue
+                if current:
+                    d = eff.match(line)
+                    if d:
+                        (overrides if is_override else names)[current] = \
+                            d.group(1)
+    except OSError:
+        pass
+    names.update(overrides)
+    return names
+
+
+def _hsl_to_rgb(h, s, l):
+    """h in degrees, s/l in 0..1 -> (r, g, b) ints."""
+    h = h % 360
+    c = (1 - abs(2 * l - 1)) * s
+    x = c * (1 - abs((h / 60) % 2 - 1))
+    m = l - c / 2
+    if h < 60:
+        rp, gp, bp = c, x, 0
+    elif h < 120:
+        rp, gp, bp = x, c, 0
+    elif h < 180:
+        rp, gp, bp = 0, c, x
+    elif h < 240:
+        rp, gp, bp = 0, x, c
+    elif h < 300:
+        rp, gp, bp = x, 0, c
+    else:
+        rp, gp, bp = c, 0, x
+    return tuple(round((v + m) * 255) for v in (rp, gp, bp))
+
+
+# (rate%, hue°, saturation, lightness): a continuous HSL health ramp —
+# brick red, through amber, into a jade "healthy" green. Resolution is
+# deliberately concentrated at the high end: 0-95% travels hue 2->80,
+# 95-100% travels 80->140, because modern providers almost never drop
+# below 95%. Saturation/lightness stay moderate for light/dark themes.
+_CACHE_STOPS = [
+    (0,    2,   0.55, 0.52),
+    (50,   22,  0.58, 0.50),
+    (75,   38,  0.60, 0.49),
+    (90,   55,  0.58, 0.47),
+    (95,   80,  0.52, 0.46),
+    (97,   100, 0.48, 0.45),
+    (98,   112, 0.46, 0.45),
+    (99,   124, 0.44, 0.45),
+    (100,  140, 0.42, 0.45),
+]
+
+
+def _cache_sgr(rate):
+    """Cache-rate color: continuous per-percent gradient emitted as a
+    24-bit SGR sequence (Windows Terminal / Warp / GNOME Terminal all
+    support truecolor; the TUI passes embedded escapes through)."""
+    rate = max(0, min(100, rate))
+    stops = _CACHE_STOPS
+    for i in range(len(stops) - 1):
+        r0, h0, s0, l0 = stops[i]
+        r1, h1, s1, l1 = stops[i + 1]
+        if rate <= r1:
+            t = (rate - r0) / (r1 - r0)
+            rgb = _hsl_to_rgb(h0 + (h1 - h0) * t,
+                              s0 + (s1 - s0) * t,
+                              l0 + (l1 - l0) * t)
+            return "38;2;%d;%d;%d" % rgb
+    rgb = _hsl_to_rgb(stops[-1][1], stops[-1][2], stops[-1][3])
+    return "38;2;%d;%d;%d" % rgb
+
+
 def stats_line(session_total, sub_by_model, display_names):
     """Session totals first, then per-model sub-agent usage, so the most
-    important info survives narrow terminals."""
+    important info survives narrow terminals. Input is painted blue,
+    output magenta, and the cache rate on a red->green ramp. At 95%+ the
+    rate keeps one decimal (95.3%); only a true 100% stays an integer."""
     def seg(u):
-        s = (f"↑ {fmt_tokens(input_total(u))} tok"
-             f" · ↓ {fmt_tokens(u['output'])} tok")
+        s = (_paint(f"↑ {fmt_tokens(input_total(u))} tok", "34")
+             + _paint(" · ", "2")
+             + _paint(f"↓ {fmt_tokens(u['output'])} tok", "35"))
         r = cache_hit_rate(u)
         if r is not None:
-            s += f" 缓存 {r}%"
+            if r >= 100:
+                text = "100%"
+            elif r >= 95:
+                text = f"{min(r, 99.9):.1f}%"
+            else:
+                text = f"{round(r)}%"
+            s += _paint(f" 缓存 {text}", _cache_sgr(r))
         return s
 
     line = "总计：" + seg(session_total)
@@ -425,7 +529,7 @@ def _cached_line(session_dir, session_id):
     try:
         with open(_cache_path(session_id), encoding="utf-8") as f:
             c = json.load(f)
-        if c.get("v") == 4 and c.get("mtime") == _max_wire_mtime(session_dir):
+        if c.get("v") == 9 and c.get("mtime") == _max_wire_mtime(session_dir):
             _debug("cache hit")
             return c.get("line"), bool(c.get("swarm")), c.get("effort")
     except (OSError, json.JSONDecodeError):
@@ -436,7 +540,7 @@ def _cached_line(session_dir, session_id):
 def _save_cache(session_dir, session_id, line, swarm_on, effort):
     try:
         with open(_cache_path(session_id), "w", encoding="utf-8") as f:
-            json.dump({"v": 4, "mtime": _max_wire_mtime(session_dir),
+            json.dump({"v": 9, "mtime": _max_wire_mtime(session_dir),
                        "line": line, "swarm": swarm_on,
                        "effort": effort}, f)
     except OSError:
@@ -453,7 +557,16 @@ def main():
     session_dir = find_session_dir(session_id, cwd)
     _debug(f"session_id={session_id!r} cwd={cwd!r} session_dir={session_dir!r}")
     if not session_dir:
-        print("kimi-usage: 未定位会话")
+        # Fresh conversations can fail session resolution for a moment
+        # (no state.json / wire files yet). Still render the prefix slots
+        # from the snapshot; the effort suffix falls back to the model's
+        # default_effort from config.toml since there is no wire log.
+        effort = model_default_efforts().get(payload.get("model") or "")
+        prefix = prefix_line(payload, model_display_names(), False, effort)
+        note = "kimi-usage: 未定位会话"
+        line = f"{prefix} | {note}" if prefix else note
+        _debug(f"line={line!r}")
+        print(line)
         return
 
     cached = _cached_line(session_dir, session_id) if session_id else None

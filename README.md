@@ -5,7 +5,7 @@
 有子 agent 时（按模型分列）：
 
 ```
-yolo plan  K3-256k thinking: max  D:/project/kimi-usage  main | 总计：↑ 91.04M tok · ↓ 508.5k tok 缓存 99% | DeepSeek V4 Flash ↑ 87.60M tok · ↓ 457.1k tok 缓存 99% | K3-256k ↑ 117.5k tok · ↓ 1.0k tok 缓存 4%
+yolo plan  K3-256k thinking: max  D:/project/kimi-usage  main | 总计：↑ 91.04M tok · ↓ 508.5k tok 缓存 99.3% | DeepSeek V4 Flash ↑ 87.60M tok · ↓ 457.1k tok 缓存 99.1% | K3-256k ↑ 117.5k tok · ↓ 1.0k tok 缓存 4%
 ```
 <img width="3092" height="291" alt="image" src="https://github.com/user-attachments/assets/15e786b8-417d-4ac3-84f9-8b3741727241" />
 
@@ -31,7 +31,9 @@ K3-256k thinking: max  D:/project/kimi-usage  main | 总计：↑ 396.0k tok · 
 实现细节：
 
 - 模式/模型/目录/分支来自 TUI 每秒传入的 JSON 快照；快照没有的 **swarm 状态**和**思考强度**改从会话 `wire.jsonl` 里的 `swarm_mode.enter/exit` 与 `profile.bind`（含 `thinkingEffort`）记录取最后一条
-- 配色用终端命名色，深浅主题都正常；设 `KIMI_USAGE_NO_COLOR=1` 输出纯文本
+- 配色：模式/目录用终端命名色；用量统计中输入蓝色、输出品红，缓存命中率走 24-bit 真彩色 HSL 渐变（砖红→琥珀→玉绿，分辨率集中在 95% 以上段）；设 `KIMI_USAGE_NO_COLOR=1` 输出纯文本
+- 缓存命中率 ≥95% 时显示一位小数（如 `96.8%`），以下取整，真 100% 仍显示整数
+- 新会话目录尚未落盘时，仍照常显示模式/模型/目录/分支（思考强度回退为模型的 `default_effort`），右侧提示 `未定位会话`
 - 用量口径：总输入 = `inputOther + inputCacheRead + inputCacheCreation`；缓存命中率 = `inputCacheRead / 总输入`
 - 无法复刻的内置项：goal / 后台任务徽标、git 增删行数、右侧轮换小提示（内置栏第 2 行的 `context: N%` 不受影响，照常显示）
 
@@ -61,7 +63,7 @@ K3-256k thinking: max  D:/project/kimi-usage  main | 总计：↑ 396.0k tok · 
 
 ### 常用命令
 
-- 升级/指定版本：`/plugins install https://github.com/YD-233/kimi-usage/releases/tag/v1.4.1`
+- 升级/指定版本：`/plugins install https://github.com/YD-233/kimi-usage/releases/tag/v1.4.2`
 - 卸载：`/plugins remove kimi-usage`
 
 ## 平台支持
