@@ -143,7 +143,12 @@ def merge(text):
         start, end = sec
         m = re.search(r"(?m)^\s*command\s*=\s*(.+)$",
                       "\n".join(lines[start:end]))
-        if m and "kimi-usage" in m.group(1).lower():
+        # Recognize our own command even when 8.3 short names mangled
+        # "kimi-usage" into "KIMI-U~N" (the ~N numbering shifts as sibling
+        # plugin dirs come and go, so a stale short name must still match).
+        cmd = m.group(1).lower() if m else ""
+        if "kimi-usage" in cmd or "kimi-u~" in cmd or "statusline.py" in cmd \
+                or "status~" in cmd:
             # our own command from a manual/older setup: adopt and refresh
             new_lines = lines[:start] + block.splitlines() + lines[end:]
             return "\n".join(new_lines) + "\n"
