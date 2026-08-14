@@ -7,12 +7,14 @@
 ```
 yolo plan  K3-256k thinking: max  D:/project/kimi-usage  main | 总计：↑ 91.04M tok · ↓ 508.5k tok 缓存 99% | DeepSeek V4 Flash ↑ 87.60M tok · ↓ 457.1k tok 缓存 99% | K3-256k ↑ 117.5k tok · ↓ 1.0k tok 缓存 4%
 ```
+<img width="3092" height="291" alt="image" src="https://github.com/user-attachments/assets/15e786b8-417d-4ac3-84f9-8b3741727241" />
 
 无子 agent 时：
 
 ```
 K3-256k thinking: max  D:/project/kimi-usage  main | 总计：↑ 396.0k tok · ↓ 13.0k tok 缓存 82%
 ```
+<img width="3082" height="263" alt="image" src="https://github.com/user-attachments/assets/c59b11ad-5793-4bae-a05d-e3809a76f7fe" />
 
 需要 kimi-code ≥ 0.30.0（[0.30.0](https://github.com/MoonshotAI/kimi-code/releases/tag/%40moonshot-ai%2Fkimi-code%400.30.0) 起支持 `[status_line].command` 自定义底部状态栏）。
 
