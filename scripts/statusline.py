@@ -11,6 +11,12 @@ Data source:
   <KIMI_CODE_HOME>/sessions/wd_*/session_*/agents/*/wire.jsonl
   (usage.record entries; each carries a "model" field)
 
+Wire files are read incrementally: the per-session cache holds a byte
+offset per wire file, so a refresh only parses what was appended since the
+last one. The first sighting of a huge session is spread over several
+refreshes (at most _MAX_TAIL_BYTES per file per run), because being killed
+mid-parse loses the cache write and would freeze the line forever.
+
 The line is fitted to the live terminal width (queried from the console,
 not the snapshot, which has no width field), degrading cheapest losses
 first: the unit shrinks "token" -> "tok" -> dropped, the git branch and
@@ -44,10 +50,46 @@ import traceback
 import unicodedata
 
 
+def _memo(fn):
+    """Cache a helper's result for the life of the process.
+
+    _fit_line rebuilds the prefix once per degradation stage, and these
+    slots each cost a stat storm (142 task files on a big session) or a
+    subprocess. One run renders one line, i.e. one instant, so caching
+    within the process cannot go stale.
+    """
+    cache = {}
+
+    def wrapper(*args):
+        try:
+            if args not in cache:
+                cache[args] = fn(*args)
+            return cache[args]
+        except TypeError:      # unhashable argument: just don't cache
+            return fn(*args)
+    wrapper.__name__ = fn.__name__
+    wrapper.__doc__ = fn.__doc__
+    return wrapper
+
+
 def kimi_home():
     return os.environ.get(
         "KIMI_CODE_HOME", os.path.expanduser("~/.kimi-code")
     )
+
+
+def force_utf8_stdout():
+    """Print UTF-8 no matter what the console code page is.
+
+    The TUI reads our stdout with setEncoding('utf-8'), but Python picks the
+    ANSI code page for a pipe: on a cp1252 console every CJK label raises
+    UnicodeEncodeError, the error fallback raises again, and the user just
+    silently gets the built-in footer.
+    """
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
 
 
 def fmt_tokens(n):
@@ -197,38 +239,104 @@ def find_session_dir(session_id, cwd):
 # wire.jsonl parsing
 # --------------------------------------------------------------------------
 
-def iter_usage_records(path):
-    """Yield (kind, record) for lines worth parsing.
+# Records worth decoding. Matched on the line's own "type" field rather than
+# a substring search: tool arguments and results are persisted verbatim
+# inside context.append_loop_event lines, so a line that merely *quotes* a
+# record name (reading this very file does it) would otherwise be taken for
+# the record itself — which used to clear the swarm badge.
+_WANTED_RECORDS = frozenset((
+    "usage.record", "profile.bind", "swarm_mode.enter", "swarm_mode.exit",
+    "llm.request", "config.update",
+))
+_TYPE_RE = re.compile(rb'^\{\s*"type"\s*:\s*"([^"]{1,40})"')
 
-    Cheap substring pre-filter keeps this fast on multi-MB wire files:
-    only usage.record / profile.bind / config.update / llm.request /
-    swarm_mode lines are JSON-decoded.
+# Reserved aliases that stand in for a real model: the subagent recipe
+# synthesizes __secondary__ (SECONDARY_DERIVED_MODEL_ALIAS upstream) and the
+# spawn tools accept the symbolic primary/secondary choices. usage.record
+# stores whichever alias was bound, so these have to be mapped back to the
+# concrete model from the same agent's llm.request records.
+_PLACEHOLDER_ALIASES = frozenset(("__secondary__", "secondary", "primary"))
+
+# Most bytes a single wire file may contribute per run, and the wall-clock
+# budget for the whole parse. A first sighting of a huge session is spread
+# over consecutive refreshes instead of blowing the 300ms cap — a killed run
+# saves nothing, so it would re-read the same bytes forever and the line
+# would never update again. The time budget makes that hold on a slow
+# machine too: whatever is left keeps its cursor and is picked up next run.
+_MAX_TAIL_BYTES = 12_000_000
+_PARSE_BUDGET_S = 0.12
+
+
+def read_wire_tail(path, start, mid, size):
+    """Read the bytes appended to `path` after offset `start`.
+
+    Returns (complete_lines, new_offset, mid). Nothing appended means no
+    open() at all — and the read is sized to what is actually there, because
+    read(_MAX_TAIL_BYTES) preallocates that many bytes even at EOF, which on
+    a session with dozens of sub-agents costs more than the parse itself.
+    A trailing partial line (the TUI may be mid-write) is left for the next
+    run, so the offset only ever advances past a newline. `mid` is carried
+    over when a single line is longer than the read cap: the offset then
+    lands inside that line and the next run drops bytes up to the following
+    newline.
     """
+    remaining = size - start
+    if remaining <= 0:
+        return b"", start, mid
     try:
-        with open(path, encoding="utf-8") as f:
-            for line in f:
-                if '"usage.record"' in line:
-                    kind = "usage.record"
-                elif '"profile.bind"' in line:
-                    kind = "profile.bind"
-                elif '"swarm_mode.' in line:
-                    kind = "swarm"
-                elif '"type":"llm.request"' in line:
-                    kind = "llm.request"
-                elif '"type":"config.update"' in line:
-                    kind = "config.update"
-                else:
-                    continue
-                try:
-                    yield kind, json.loads(line)
-                except json.JSONDecodeError:
-                    continue
+        with open(path, "rb") as f:
+            f.seek(start)
+            chunk = f.read(min(_MAX_TAIL_BYTES, remaining))
     except OSError:
-        return
+        return b"", start, mid
+    at_eof = len(chunk) >= remaining
+    if mid:
+        nl = chunk.find(b"\n")
+        if nl < 0:
+            return b"", start + len(chunk), not at_eof
+        start += nl + 1
+        chunk = chunk[nl + 1:]
+    cut = chunk.rfind(b"\n")
+    if cut < 0:
+        # no complete line: either wait for the writer, or step over a line
+        # that is longer than the cap (a huge tool result, never a record).
+        return b"", start if at_eof else start + len(chunk), not at_eof
+    return chunk[:cut + 1], start + cut + 1, False
 
 
-def parse_session(session_dir):
-    """Return (session_total, sub_by_model, swarm_on, effort).
+def iter_wire_records(chunk):
+    """Yield (type, record) for the records of interest in `chunk`."""
+    for raw in chunk.splitlines():
+        m = _TYPE_RE.match(raw)
+        if m is None:
+            continue
+        kind = m.group(1).decode("ascii", "ignore")
+        if kind not in _WANTED_RECORDS:
+            continue
+        try:
+            rec = json.loads(raw.decode("utf-8", "ignore"))
+        except json.JSONDecodeError:
+            continue
+        if isinstance(rec, dict):
+            yield kind, rec
+
+
+def _usage_of(rec, keys):
+    """The record's usage counters, coerced to ints; None when unusable."""
+    usage = rec.get("usage")
+    if not isinstance(usage, dict):
+        return None
+    out = {}
+    for k in keys:
+        try:
+            out[k] = int(usage.get(k, 0) or 0)
+        except (TypeError, ValueError):
+            out[k] = 0
+    return out
+
+
+def parse_session(session_dir, prior=None):
+    """Return (session_total, sub_by_model, swarm_on, effort, files).
 
     session_total: usage aggregated over every agent in the session
     (main + sub-agents).
@@ -240,21 +348,59 @@ def parse_session(session_dir):
     freshest source is llm.request (written on every model request);
     config.update covers the legacy engine. This tracks /effort
     switches as soon as the next request goes out.
-    """
-    session_total = empty_usage()
-    sub_by_model = {}
-    swarm_on = False
-    effort = None
+    files:         per-agent parse cursor ({agent: {offset, mid, bound,
+    real}}) to hand back as `prior` next time.
 
-    for wire in glob.glob(os.path.join(session_dir, "agents", "*",
-                                       "wire.jsonl")):
+    With `prior` the totals are carried over and only the bytes appended
+    since the recorded offsets are read, so a refresh costs the same on a
+    100MB session as on a fresh one. A wire that shrank (append-only in
+    practice, but a copied or truncated session would) forces one full
+    re-parse, since per-file subtotals are not kept.
+    """
+    prior = prior if isinstance(prior, dict) else {}
+    session_total = add_usage(empty_usage(), prior.get("session_total") or {})
+    sub_by_model = {}
+    for model, u in (prior.get("sub_by_model") or {}).items():
+        if isinstance(u, dict):
+            sub_by_model[str(model)] = add_usage(empty_usage(), u)
+    swarm_on = bool(prior.get("swarm"))
+    effort = prior.get("effort")
+    prior_files = prior.get("files")
+    prior_files = prior_files if isinstance(prior_files, dict) else {}
+    # start from the previous cursors so an early stop (time budget) leaves
+    # the untouched files where they were instead of rewinding them to 0
+    files = {k: v for k, v in prior_files.items() if isinstance(v, dict)}
+    deadline = time.monotonic() + _PARSE_BUDGET_S
+
+    for wire in glob.glob(os.path.join(glob.escape(session_dir), "agents",
+                                       "*", "wire.jsonl")):
         agent = os.path.basename(os.path.dirname(wire))
         is_main = agent == "main"
-        bound_model = None
-        for kind, rec in iter_usage_records(wire):
-            if kind == "swarm":
+        cursor = prior_files.get(agent)
+        cursor = cursor if isinstance(cursor, dict) else {}
+        try:
+            start = max(0, int(cursor.get("offset") or 0))
+        except (TypeError, ValueError):
+            start = 0
+        bound_model = cursor.get("bound")
+        real_model = cursor.get("real")
+        try:
+            size = os.path.getsize(wire)
+        except OSError:
+            continue
+        if start and size < start:
+            _debug(f"{agent}: wire shrank below cursor, full re-parse")
+            return parse_session(session_dir, None)
+        if size > start and time.monotonic() > deadline:
+            _debug(f"{agent}: parse budget spent, resuming next run")
+            continue
+
+        chunk, offset, mid = read_wire_tail(wire, start,
+                                            bool(cursor.get("mid")), size)
+        for kind, rec in iter_wire_records(chunk):
+            if kind in ("swarm_mode.enter", "swarm_mode.exit"):
                 if is_main:
-                    swarm_on = rec.get("type") == "swarm_mode.enter"
+                    swarm_on = kind == "swarm_mode.enter"
                 continue
             if kind == "profile.bind":
                 bound_model = rec.get("modelAlias") or bound_model
@@ -263,24 +409,40 @@ def parse_session(session_dir):
                                      rec.get("thinkingLevel", effort))
                 continue
             if kind in ("llm.request", "config.update"):
+                bound_model = rec.get("modelAlias") or bound_model
+                # llm.request carries the concrete model behind the bound
+                # alias — the only way back to a real name when the alias is
+                # a placeholder.
+                if kind == "llm.request" and rec.get("model"):
+                    real_model = rec["model"]
                 if is_main:
                     e = rec.get("thinkingEffort",
                                 rec.get("thinkingLevel"))
                     if e is not None:
                         effort = e
                 continue
-            u = {k: int(rec.get("usage", {}).get(k, 0) or 0)
-                 for k in session_total}
+            u = _usage_of(rec, session_total)
+            if u is None:
+                continue
             add_usage(session_total, u)
             if is_main:
                 continue
-            model = rec.get("model") or bound_model or "unknown"
+            model = rec.get("model")
+            if not isinstance(model, str):
+                model = ""
+            if not model or model in _PLACEHOLDER_ALIASES:
+                model = real_model or bound_model or model
+            if not isinstance(model, str) or not model:
+                model = "unknown"
             bucket = sub_by_model.get(model)
             if bucket is None:
                 bucket = sub_by_model[model] = empty_usage()
             add_usage(bucket, u)
 
-    return session_total, sub_by_model, swarm_on, effort
+        files[agent] = {"offset": offset, "mid": mid,
+                        "bound": bound_model, "real": real_model}
+
+    return session_total, sub_by_model, swarm_on, effort, files
 
 
 # --------------------------------------------------------------------------
@@ -292,17 +454,25 @@ def short_model(model):
     return model.rsplit("/", 1)[-1] if model else model
 
 
+@_memo
 def model_display_names():
     """alias -> display_name, scanned from the [models] table in config.toml.
 
     Regex scan instead of tomllib to keep Python 3.7 compatibility;
-    [models."<alias>".overrides] entries win over the base section.
+    [models."<alias>".overrides] entries win over the base section. Each
+    entry's `model` (the provider-side name) is registered as a second key
+    for the same display name: when a sub-agent's usage was booked under a
+    placeholder alias, all we can recover from the wire is that provider-side
+    name, and it should still read "DeepSeek V4 Pro" rather than
+    "deepseek-v4-pro".
     """
     header = re.compile(
         r'^\s*\[\s*models\.\s*(?:"([^"]+)"|([A-Za-z0-9_\-]+))'
         r'(\s*\.\s*overrides\s*)?\]\s*$')
     disp = re.compile(r'^\s*display_name\s*=\s*"([^"]+)"')
+    mdl = re.compile(r'^\s*model\s*=\s*"([^"]+)"')
     names, overrides = {}, {}
+    models, model_overrides = {}, {}
     current, is_override = None, False
     try:
         with open(os.path.join(kimi_home(), "config.toml"),
@@ -321,12 +491,22 @@ def model_display_names():
                     if d:
                         (overrides if is_override else names)[current] = \
                             d.group(1)
+                        continue
+                    p = mdl.match(line)
+                    if p:
+                        (model_overrides if is_override else
+                         models)[current] = p.group(1)
     except OSError:
         pass
     names.update(overrides)
+    models.update(model_overrides)
+    for alias, provider_model in models.items():
+        if provider_model not in names and alias in names:
+            names[provider_model] = names[alias]
     return names
 
 
+@_memo
 def model_default_efforts():
     """alias -> default_effort, scanned from the [models] table in
     config.toml. Used as the thinking-effort fallback when the session
@@ -472,6 +652,10 @@ def stats_line(session_total, sub_by_model, display_names,
 
 _ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 
+# Upstream wraps the footer in GutterContainer(CHROME_GUTTER, CHROME_GUTTER),
+# so the status line gets the terminal width minus one column on each side.
+_CHROME_GUTTER = 1
+
 
 def _visible_len(s):
     """Terminal column count of a rendered line: ANSI escapes ignored,
@@ -501,7 +685,7 @@ def _truncate(s, width):
         i += 1
     out.append("…")
     if _colors_on():
-        out.append("\x1b[0m")
+        out.append(_SGR_CLOSE)
     return "".join(out)
 
 
@@ -627,6 +811,15 @@ def _colors_on():
             and not os.environ.get("KIMI_USAGE_NO_COLOR"))
 
 
+# Close a painted span with "normal intensity + default foreground" instead
+# of a full reset. The TUI wraps our whole line in chalk.hex(colors.text),
+# and chalk re-opens its color wherever it finds its own close code
+# (\x1b[39m) inside the string — a full \x1b[0m just kills it, which would
+# leave everything after our first colored span (i.e. the entire usage
+# section) in the terminal's default foreground instead of the theme's.
+_SGR_CLOSE = "\x1b[22m\x1b[39m"
+
+
 def _paint(text, code):
     """Wrap text in an ANSI SGR escape. The TUI paints the whole custom
     line in colors.text, so embedded escapes reproduce the built-in
@@ -635,7 +828,7 @@ def _paint(text, code):
     which keeps theme="auto" sensible in both dark and light terminals."""
     if not text or not _colors_on():
         return text
-    return f"\x1b[{code}m{text}\x1b[0m"
+    return f"\x1b[{code}m{text}{_SGR_CLOSE}"
 
 
 # --------------------------------------------------------------------------
@@ -650,6 +843,7 @@ _LIGHT_RAINBOW = ["#1565C0", "#00838F", "#0E7A38", "#92660A", "#9A4A00",
 _DANCE_FLOW_S = 3.0      # upstream DANCE_FLOW_MS = 3000
 
 
+@_memo
 def _dance_palette():
     """Light palette only for an explicit light theme; dark otherwise
     (upstream picks by theme text color, which we can't see)."""
@@ -676,7 +870,7 @@ def _rainbow_text(text, phase, palette):
         hexc = palette[i % len(palette)]
         i += 1
         r, g, b = (int(hexc[j:j + 2], 16) for j in (1, 3, 5))
-        out.append(f"\x1b[38;2;{r};{g};{b}m{ch}\x1b[0m")
+        out.append(f"\x1b[38;2;{r};{g};{b}m{ch}{_SGR_CLOSE}")
     return "".join(out)
 
 
@@ -700,6 +894,7 @@ def _history_path(cwd):
     return None
 
 
+@_memo
 def dance_state(cwd):
     """Reproduce the /dance easter egg state from the input history, where
     every submitted slash command is recorded. Returns "on" (hold),
@@ -747,6 +942,7 @@ def dance_state(cwd):
 # goal badge and background-task badges
 # --------------------------------------------------------------------------
 
+@_memo
 def goal_badge(session_dir):
     """[goal ● active · 4m · 7 turns] from state.json's reserved custom
     metadata key "goal" (a goalSnapshot: status, turnsUsed, wallClockMs,
@@ -790,6 +986,7 @@ def goal_badge(session_dir):
             + _paint(f" {status} · {elapsed} · {turns}]", "2"))
 
 
+@_memo
 def task_badges(session_dir):
     """[N tasks running] / [N agents running] from the per-agent task
     records (agents/*/tasks/<id>.json). bash-* ids are shell tasks,
@@ -879,6 +1076,7 @@ def _probe_git(cwd):
         return None
 
 
+@_memo
 def git_status(cwd):
     """(dirty, ahead, behind, added, deleted) with a TTL file cache, so
     the 300ms command budget only pays for git spawns once per 15s."""
@@ -1014,18 +1212,10 @@ def prefix_line(payload, display_names, swarm_on, effort,
 
 
 # --------------------------------------------------------------------------
-# per-session cache (invalidate on any wire.jsonl mtime change)
+# per-session cache (parse cursors + the totals they produced)
 # --------------------------------------------------------------------------
 
-def _wire_files(session_dir):
-    return glob.glob(os.path.join(session_dir, "agents", "*", "wire.jsonl"))
-
-
-def _max_wire_mtime(session_dir):
-    files = _wire_files(session_dir)
-    if not files:
-        return 0
-    return max((os.path.getmtime(f) for f in files), default=0)
+_CACHE_VERSION = 11
 
 
 def _cache_path(session_id):
@@ -1035,33 +1225,41 @@ def _cache_path(session_id):
     return os.path.join(base, f"{safe}.json")
 
 
-def _cached_stats(session_dir, session_id):
-    """Return (session_total, sub_by_model, swarm_on, effort) when the
-    wire files are unchanged since the cache write. Raw stats are cached
-    rather than the rendered line: rendering depends on the live terminal
-    width, which can change between runs (window resize)."""
+def _load_cache(session_id):
+    """Previous run's totals plus the per-file cursors that produced them.
+
+    The cursors are self-validating (a byte offset per wire file), so no
+    mtime comparison is needed — which also removes the race the old scheme
+    had: it stamped the mtime *after* parsing, so anything appended while
+    the parse was running counted as already accounted for and was lost.
+    Raw stats are cached rather than the rendered line, because rendering
+    depends on the live terminal width (window resize)."""
     try:
         with open(_cache_path(session_id), encoding="utf-8") as f:
             c = json.load(f)
-        if c.get("v") == 10 and c.get("mtime") == _max_wire_mtime(session_dir):
-            _debug("cache hit")
-            return (c["session_total"], c["sub_by_model"],
-                    bool(c.get("swarm")), c.get("effort"))
-    except (OSError, json.JSONDecodeError, KeyError, TypeError):
-        pass
+    except (OSError, json.JSONDecodeError):
+        return None
+    if isinstance(c, dict) and c.get("v") == _CACHE_VERSION:
+        return c
     return None
 
 
-def _save_cache(session_dir, session_id, session_total, sub_by_model,
-                swarm_on, effort):
+def _save_cache(session_id, session_total, sub_by_model, swarm_on, effort,
+                files):
+    path = _cache_path(session_id)
+    tmp = f"{path}.{os.getpid()}.tmp"
     try:
-        with open(_cache_path(session_id), "w", encoding="utf-8") as f:
-            json.dump({"v": 10, "mtime": _max_wire_mtime(session_dir),
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump({"v": _CACHE_VERSION,
                        "session_total": session_total,
                        "sub_by_model": sub_by_model, "swarm": swarm_on,
-                       "effort": effort}, f)
+                       "effort": effort, "files": files}, f)
+        os.replace(tmp, path)   # a run killed at the 300ms cap can't corrupt it
     except OSError:
-        pass
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
 
 
 def main():
@@ -1086,17 +1284,14 @@ def main():
         print(line)
         return
 
-    cached = _cached_stats(session_dir, session_id) if session_id else None
-    if cached is not None:
-        session_total, sub_by_model, swarm_on, effort = cached
-    else:
-        session_total, sub_by_model, swarm_on, effort = \
-            parse_session(session_dir)
+    prior = _load_cache(session_id) if session_id else None
+    session_total, sub_by_model, swarm_on, effort, files = \
+        parse_session(session_dir, prior)
+    if session_id and files != (prior or {}).get("files"):
         _debug(f"swarm_on={swarm_on} effort={effort!r} "
                f"sub_models={list(sub_by_model)}")
-        if session_id:
-            _save_cache(session_dir, session_id, session_total,
-                        sub_by_model, swarm_on, effort)
+        _save_cache(session_id, session_total, sub_by_model, swarm_on,
+                    effort, files)
 
     if effort is None:
         # No effort record in the wire yet (fresh session before the
@@ -1108,6 +1303,12 @@ def main():
     # fitted to the live terminal width, so a window resize takes effect
     # on the next refresh instead of after the wire files change.
     width = _terminal_width(payload)
+    if width:
+        # The footer renders inside a one-column gutter on each side
+        # (CHROME_GUTTER upstream), so the line only gets width - 2 columns;
+        # overshooting means the TUI cuts the tail off with "..." instead of
+        # letting our own degradation ladder drop a slot.
+        width = max(1, width - 2 * _CHROME_GUTTER)
     line = _fit_line(payload, session_total, sub_by_model,
                      model_display_names(), swarm_on, effort, width,
                      session_dir=session_dir)
@@ -1116,6 +1317,7 @@ def main():
 
 
 if __name__ == "__main__":
+    force_utf8_stdout()
     try:
         main()
     except Exception as e:
