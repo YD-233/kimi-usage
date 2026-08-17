@@ -24,13 +24,18 @@ cwd leave the prefix, the "总计："/"缓存" labels drop, " · " tightens,
 sub-agent columns fall from the smallest consumer, and only as a last
 resort the line is cut with an ellipsis.
 
-The custom line replaces the built-in footer line 1 entirely, so the
-built-in slots that would otherwise vanish are reproduced here: mode
-badges, goal badge, model + thinking effort (tracked from the wire's
-llm.request / profile.bind records, which follow /effort switches),
-background task badges, cwd, git branch — and the /dance easter egg's
-rainbow model label (detected from the per-cwd input history, where
-/dance commands are recorded).
+The custom line replaces the built-in footer line 1 entirely (line 2, the
+right-aligned context readout, stays built-in), so the built-in slots that
+would otherwise vanish are reproduced here in upstream's order and
+spacing: mode badges, goal badge (wall clock anchored to when the goal
+snapshot last changed, mirroring upstream's goalObservedAtMs), model +
+thinking effort (tracked from the wire's llm.request / profile.bind
+records, which follow /effort switches), background task badges, cwd, git
+branch with diff stats and PR badge — and the /dance easter egg's rainbow
+model label (detected from the per-cwd input history, where /dance
+commands are recorded; hold freezes at the same palette phase upstream's
+3s flow lands on). Only the rotating tips are skipped: upstream itself
+never renders them next to a custom line.
 
 Fail-open by design: any error prints a fallback indicator so the user can
 see something is wrong, rather than silently falling back to the built-in
@@ -43,6 +48,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import sys
 import threading
 import time
@@ -400,11 +406,21 @@ def parse_session(session_dir, prior=None):
     re-parse, since per-file subtotals are not kept.
     """
     prior = prior if isinstance(prior, dict) else {}
-    session_total = add_usage(empty_usage(), prior.get("session_total") or {})
+    try:
+        session_total = add_usage(empty_usage(),
+                                  prior.get("session_total") or {})
+    except (TypeError, ValueError):
+        session_total = empty_usage()      # hand-edited / corrupt cache
     sub_by_model = {}
-    for model, u in (prior.get("sub_by_model") or {}).items():
-        if isinstance(u, dict):
+    prior_subs = prior.get("sub_by_model")
+    prior_subs = prior_subs if isinstance(prior_subs, dict) else {}
+    for model, u in prior_subs.items():
+        if not isinstance(u, dict):
+            continue
+        try:
             sub_by_model[str(model)] = add_usage(empty_usage(), u)
+        except (TypeError, ValueError):
+            continue                   # skip the corrupt bucket only
     swarm_on = bool(prior.get("swarm"))
     effort = prior.get("effort")
     prior_files = prior.get("files")
@@ -497,24 +513,30 @@ def short_model(model):
 
 
 @_memo
-def model_display_names():
-    """alias -> display_name, scanned from the [models] table in config.toml.
+def _model_config():
+    """One scan of the [models] table in config.toml.
 
-    Regex scan instead of tomllib to keep Python 3.7 compatibility;
-    [models."<alias>".overrides] entries win over the base section. Each
-    entry's `model` (the provider-side name) is registered as a second key
-    for the same display name: when a sub-agent's usage was booked under a
-    placeholder alias, all we can recover from the wire is that provider-side
-    name, and it should still read "DeepSeek V4 Pro" rather than
-    "deepseek-v4-pro".
+    Returns (display_names, default_efforts): alias -> display_name and
+    alias -> default_effort. Regex scan instead of tomllib to keep Python
+    3.7 compatibility; [models."<alias>".overrides] entries win over the
+    base section. Both maps additionally register the entry's
+    provider-side `model` and its display_name as keys for the same
+    value, because the spellings seen at runtime vary: the snapshot's
+    "model" field is already the display name (upstream's
+    statusLinePayload runs it through modelDisplayName), older versions
+    sent the alias, and a sub-agent whose usage was booked under a
+    placeholder alias leaves only the provider-side name in the wire —
+    which should still read "DeepSeek V4 Pro", not "deepseek-v4-pro".
     """
     header = re.compile(
         r'^\s*\[\s*models\.\s*(?:"([^"]+)"|([A-Za-z0-9_\-]+))'
         r'(\s*\.\s*overrides\s*)?\]\s*$')
     disp = re.compile(r'^\s*display_name\s*=\s*"([^"]+)"')
     mdl = re.compile(r'^\s*model\s*=\s*"([^"]+)"')
-    names, overrides = {}, {}
-    models, model_overrides = {}, {}
+    eff = re.compile(r'^\s*default_effort\s*=\s*"([^"]+)"')
+    names, names_o = {}, {}
+    models, models_o = {}, {}
+    efforts, efforts_o = {}, {}
     current, is_override = None, False
     try:
         with open(os.path.join(kimi_home(), "config.toml"),
@@ -528,59 +550,51 @@ def model_display_names():
                 if line.lstrip().startswith("["):
                     current, is_override = None, False
                     continue
-                if current:
-                    d = disp.match(line)
-                    if d:
-                        (overrides if is_override else names)[current] = \
-                            d.group(1)
-                        continue
-                    p = mdl.match(line)
-                    if p:
-                        (model_overrides if is_override else
-                         models)[current] = p.group(1)
+                if not current:
+                    continue
+                d = disp.match(line)
+                if d:
+                    (names_o if is_override else names)[current] = \
+                        d.group(1)
+                    continue
+                p = mdl.match(line)
+                if p:
+                    (models_o if is_override else models)[current] = \
+                        p.group(1)
+                    continue
+                e = eff.match(line)
+                if e:
+                    (efforts_o if is_override else efforts)[current] = \
+                        e.group(1)
     except OSError:
         pass
-    names.update(overrides)
-    models.update(model_overrides)
+    names.update(names_o)
+    models.update(models_o)
+    efforts.update(efforts_o)
     for alias, provider_model in models.items():
         if provider_model not in names and alias in names:
             names[provider_model] = names[alias]
-    return names
+        if alias in efforts:
+            efforts.setdefault(provider_model, efforts[alias])
+    for alias, disp_name in names.items():
+        if alias in efforts:
+            efforts.setdefault(disp_name, efforts[alias])
+    return names, efforts
 
 
-@_memo
+def model_display_names():
+    """alias/provider-model -> display_name from config.toml; see
+    _model_config."""
+    return _model_config()[0]
+
+
 def model_default_efforts():
-    """alias -> default_effort, scanned from the [models] table in
-    config.toml. Used as the thinking-effort fallback when the session
-    wire log is not available yet (e.g. a brand-new conversation whose
-    session directory has not been located)."""
-    header = re.compile(
-        r'^\s*\[\s*models\.\s*(?:"([^"]+)"|([A-Za-z0-9_\-]+))'
-        r'(\s*\.\s*overrides\s*)?\]\s*$')
-    eff = re.compile(r'^\s*default_effort\s*=\s*"([^"]+)"')
-    names, overrides = {}, {}
-    current, is_override = None, False
-    try:
-        with open(os.path.join(kimi_home(), "config.toml"),
-                  encoding="utf-8") as f:
-            for line in f:
-                m = header.match(line)
-                if m:
-                    current = m.group(1) or m.group(2)
-                    is_override = bool(m.group(3))
-                    continue
-                if line.lstrip().startswith("["):
-                    current, is_override = None, False
-                    continue
-                if current:
-                    d = eff.match(line)
-                    if d:
-                        (overrides if is_override else names)[current] = \
-                            d.group(1)
-    except OSError:
-        pass
-    names.update(overrides)
-    return names
+    """model spelling -> default_effort from config.toml (alias, provider
+    model and display name all work as keys); see _model_config. Used as
+    the thinking-effort fallback when the session wire log is not
+    available yet (e.g. a brand-new conversation whose session directory
+    has not been located)."""
+    return _model_config()[1]
 
 
 def _hsl_to_rgb(h, s, l):
@@ -692,7 +706,10 @@ def stats_line(session_total, sub_by_model, display_names,
 # width detection and graceful degradation
 # --------------------------------------------------------------------------
 
-_ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+# SGR spans plus OSC 8 hyperlinks (ESC ]8;;url BEL ... ESC ]8;; BEL,
+# optionally ST-terminated) — the PR badge is hyperlinked, and both width
+# math and truncation must treat the whole sequence as zero-width.
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*m|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)")
 
 # Upstream wraps the footer in GutterContainer(CHROME_GUTTER, CHROME_GUTTER),
 # so the status line gets the terminal width minus one column on each side.
@@ -790,7 +807,8 @@ def _terminal_width(payload):
 
 
 def _fit_line(payload, session_total, sub_by_model, display_names,
-              swarm_on, effort, width, session_dir=None):
+              swarm_on, effort, width, session_dir=None,
+              goal_observed=None):
     """Render prefix + stats to fit `width` columns by graceful
     degradation, cheapest losses first: unit "token" -> "tok" ->
     dropped, git branch dropped, cwd dropped, the "总计：" and "缓存"
@@ -821,7 +839,7 @@ def _fit_line(payload, session_total, sub_by_model, display_names,
             return usage
         p = prefix_line(payload, display_names, swarm_on, effort,
                         with_cwd=o["with_cwd"], with_git=o["with_git"],
-                        session_dir=session_dir)
+                        session_dir=session_dir, goal_observed=goal_observed)
         return f"{p} | {usage}" if p else usage
 
     opts = dict(base)
@@ -939,10 +957,12 @@ def _history_path(cwd):
 @_memo
 def dance_state(cwd):
     """Reproduce the /dance easter egg state from the input history, where
-    every submitted slash command is recorded. Returns "on" (hold),
-    "flow" (within the ~3s flow window), or None. Only the last dance
-    command matters: "/dance on" holds, "/dance off" clears, and a bare
-    "/dance" flows for DANCE_FLOW_S then fades — the flow window is
+    every submitted slash command is recorded. Returns "on" (static hold),
+    "flow" (within the ~3s flow window), or None — following upstream's
+    tryHandleDanceCommand: "/dance off" clears immediately, "/dance on"
+    flows first and only then freezes into the static rainbow, anything
+    else flows and fades. Sub-command matching is case-insensitive, same
+    as upstream (parsed.args.trim().toLowerCase()). The flow window is
     reckoned from the history file's mtime, since entries carry no
     timestamp of their own."""
     path = _history_path(cwd)
@@ -963,18 +983,21 @@ def dance_state(cwd):
             except json.JSONDecodeError:
                 continue
             content = content.strip()
-            if content == "/dance on":
-                last = "on"
-            elif content == "/dance off":
+            if content != "/dance" and not content.startswith("/dance "):
+                continue
+            sub = content[len("/dance"):].strip().lower()
+            if sub == "off":
                 last = None
-            elif content == "/dance" or content.startswith("/dance "):
+            elif sub == "on":
+                last = "on"
+            else:
                 last = "flow"
-        if last == "on":
-            return "on"
-        if last == "flow":
+        if last in ("on", "flow"):
             age = time.time() - os.path.getmtime(path)
             if age <= _DANCE_FLOW_S + 0.5:
                 return "flow"
+            if last == "on":
+                return "on"
     except OSError:
         pass
     return None
@@ -985,37 +1008,76 @@ def dance_state(cwd):
 # --------------------------------------------------------------------------
 
 @_memo
-def goal_badge(session_dir):
-    """[goal ● active · 4m · 7 turns] from state.json's reserved custom
-    metadata key "goal" (a goalSnapshot: status, turnsUsed, wallClockMs,
-    budget). Only live (active/paused/blocked) goals get a badge, same
-    as the built-in footer."""
+def _goal_snapshot(session_dir):
+    """The goalSnapshot persisted under state.json's reserved custom key
+    "goal" ({goalId, status, turnsUsed, tokensUsed, wallClockMs, budget,
+    terminalReason, ...}), or None. The TUI keeps its own copy in memory;
+    this on-disk mirror is what a status-line command can read."""
     try:
-        state_path = os.path.join(session_dir, "state.json")
-        with open(state_path, encoding="utf-8") as f:
+        with open(os.path.join(session_dir, "state.json"),
+                  encoding="utf-8") as f:
             goal = (json.load(f).get("custom") or {}).get("goal")
     except (OSError, json.JSONDecodeError):
         return None
-    if not isinstance(goal, dict):
+    return goal if isinstance(goal, dict) else None
+
+
+def _goal_key(goal):
+    """Identity of a goal snapshot, mirroring upstream's goalSnapshotKey:
+    the footer restarts its wall-clock anchor whenever any of these
+    fields changes."""
+    if goal is None:
+        return None
+    budget = goal.get("budget") or {}
+    if not isinstance(budget, dict):
+        budget = {}
+    return "\0".join(str(x) for x in (
+        goal.get("goalId"), goal.get("status"),
+        goal.get("terminalReason") or "",
+        goal.get("turnsUsed"), goal.get("tokensUsed"),
+        goal.get("wallClockMs"),
+        budget.get("tokenBudget"), budget.get("turnBudget"),
+        budget.get("wallClockBudgetMs")))
+
+
+@_memo
+def goal_badge(session_dir, observed_at=None):
+    """[goal ● active · 4m · 7 turns], a port of upstream's
+    formatGoalBadge. Only live (active/paused/blocked) goals get a badge,
+    same as the built-in footer. An active goal's wall clock keeps
+    ticking past the persisted snapshot: upstream adds the time since the
+    snapshot last changed (goalObservedAtMs); we get the same anchor from
+    the per-session cache (observed_at), falling back to the state file's
+    mtime when there is no cache to carry it."""
+    goal = _goal_snapshot(session_dir)
+    if goal is None:
         return None
     status = goal.get("status")
     if status not in ("active", "paused", "blocked"):
         return None
-    turns_used = int(goal.get("turnsUsed", 0) or 0)
-    turn_budget = (goal.get("budget") or {}).get("turnBudget")
+    try:
+        turns_used = int(goal.get("turnsUsed", 0) or 0)
+    except (TypeError, ValueError):
+        turns_used = 0
+    budget = goal.get("budget") or {}
+    turn_budget = budget.get("turnBudget") if isinstance(budget, dict) \
+        else None
     if turn_budget is not None:
         turns = f"{turns_used}/{turn_budget} turns"
     else:
         turns = f"{turns_used} " + ("turn" if turns_used == 1 else "turns")
-    wall_ms = float(goal.get("wallClockMs", 0) or 0)
+    try:
+        wall_ms = float(goal.get("wallClockMs", 0) or 0)
+    except (TypeError, ValueError):
+        wall_ms = 0.0
     if status == "active":
-        # Live goals keep ticking; upstream adds wall time observed since
-        # the last snapshot, we approximate with the state file's age.
-        try:
-            wall_ms += max(0.0, (time.time()
-                                 - os.path.getmtime(state_path)) * 1000)
-        except OSError:
-            pass
+        if observed_at is None:
+            try:
+                observed_at = os.path.getmtime(
+                    os.path.join(session_dir, "state.json"))
+            except OSError:
+                observed_at = time.time()
+        wall_ms += max(0.0, (time.time() - observed_at) * 1000)
     secs = int(round(wall_ms / 1000.0))
     if secs < 60:
         elapsed = f"{secs}s"
@@ -1028,14 +1090,35 @@ def goal_badge(session_dir):
             + _paint(f" {status} · {elapsed} · {turns}]", "2"))
 
 
-@_memo
-def task_badges(session_dir):
-    """[N tasks running] / [N agents running] from the per-agent task
-    records (agents/*/tasks/<id>.json). bash-* ids are shell tasks,
-    agent-* ids are background sub-agents; only "running" counts."""
+_TASKS_CACHE_TTL = 2.0    # badges may lag a task start/finish by this much
+
+
+def _tasks_cache_path(session_dir):
+    base = os.path.join(kimi_home(), "kimi-usage-cache")
+    safe = hashlib.sha256(session_dir.encode("utf-8")).hexdigest()[:16]
+    return os.path.join(base, f"tasks-{safe}.json")
+
+
+def _count_running_tasks(session_dir):
+    """(bash, agent) running-task counts with a small TTL file cache.
+
+    Every status-line run is a fresh process, so @_memo alone would still
+    open every agents/*/tasks/*.json once per second (142 files on a big
+    session). The counts only change when a background task starts or
+    finishes, so a 2s staleness is invisible in practice."""
+    path = _tasks_cache_path(session_dir)
+    try:
+        with open(path, encoding="utf-8") as f:
+            cached = json.load(f)
+        v = cached["v"]
+        if time.time() - cached["t"] < _TASKS_CACHE_TTL:
+            return int(v[0]), int(v[1])
+    except (OSError, json.JSONDecodeError, KeyError, TypeError,
+            ValueError, IndexError):
+        pass
     bash_n = agent_n = 0
-    for tf in glob.glob(os.path.join(session_dir, "agents", "*", "tasks",
-                                     "*.json")):
+    for tf in glob.glob(os.path.join(glob.escape(session_dir), "agents",
+                                     "*", "tasks", "*.json")):
         name = os.path.basename(tf)
         if name.startswith("bash-"):
             kind = "bash"
@@ -1053,6 +1136,26 @@ def task_badges(session_dir):
             bash_n += 1
         else:
             agent_n += 1
+    tmp = f"{path}.{os.getpid()}.tmp"
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump({"t": time.time(), "v": [bash_n, agent_n]}, f)
+        os.replace(tmp, path)
+    except OSError:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+    return bash_n, agent_n
+
+
+@_memo
+def task_badges(session_dir):
+    """[N tasks running] / [N agents running] from the per-agent task
+    records (agents/*/tasks/<id>.json). bash-* ids are shell tasks,
+    agent-* ids are background sub-agents; only "running" counts."""
+    bash_n, agent_n = _count_running_tasks(session_dir)
     badges = []
     if bash_n:
         noun = "task" if bash_n == 1 else "tasks"
@@ -1068,6 +1171,15 @@ def task_badges(session_dir):
 # --------------------------------------------------------------------------
 
 _GIT_CACHE_TTL = 15.0   # mirrors upstream STATUS_TTL_MS
+
+_RUN_STARTED = None   # monotonic time this run's main() started
+
+
+def _over_budget():
+    """Whether this run has already spent most of the 300ms the TUI
+    allows the status-line command before taskkilling it."""
+    return (_RUN_STARTED is not None
+            and time.monotonic() - _RUN_STARTED > 0.18)
 
 
 def _git_cache_path(cwd):
@@ -1132,6 +1244,10 @@ def git_status(cwd):
             return c.get("v")
     except (OSError, json.JSONDecodeError):
         pass
+    if _over_budget():
+        # The wire parse already ate the 300ms spawn budget; keep the
+        # stale badge rather than risk being taskkill'd mid-probe.
+        return cached.get("v") if isinstance(cached, dict) else None
     v = _probe_git(cwd)
     if v is None and cached is not None:
         return cached.get("v")  # keep stale data on probe failure
@@ -1145,8 +1261,7 @@ def git_status(cwd):
 
 
 def git_badge(branch, status):
-    """branch [+a -d ↑x ↓y], mirroring upstream formatGitBadgeBase.
-    The PR badge is not reproduced (needs a gh call)."""
+    """branch [+a -d ↑x ↓y], mirroring upstream formatGitBadgeBase."""
     if not status:
         return branch
     parts = []
@@ -1169,6 +1284,145 @@ def git_badge(branch, status):
     return f"{branch} [{' '.join(parts)}]" if parts else branch
 
 
+# --------------------------------------------------------------------------
+# PR badge (gh pr view, detached)
+# --------------------------------------------------------------------------
+
+_PR_CACHE_TTL = 60.0   # mirrors upstream PULL_REQUEST_TTL_MS
+
+
+def _pr_cache_path(cwd):
+    base = os.path.join(kimi_home(), "kimi-usage-cache")
+    safe = hashlib.sha256(cwd.encode("utf-8")).hexdigest()[:16]
+    return os.path.join(base, f"pr-{safe}.json")
+
+
+def _hyperlink(text, url):
+    """OSC 8 terminal hyperlink, mirroring upstream's toTerminalHyperlink
+    (an unsafe URL degrades to plain text)."""
+    if url.startswith("https://") or url.startswith("http://"):
+        return f"\x1b]8;;{url}\x07{text}\x1b]8;;\x07"
+    return text
+
+
+@_memo
+def _gh_path():
+    return shutil.which("gh")
+
+
+def _read_pr_cache(path):
+    try:
+        with open(path, encoding="utf-8") as f:
+            c = json.load(f)
+        if isinstance(c, dict) and isinstance(c.get("t"), (int, float)):
+            return c
+    except (OSError, json.JSONDecodeError):
+        pass
+    return None
+
+
+def _write_pr_cache(path, branch, value):
+    tmp = f"{path}.{os.getpid()}.tmp"
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump({"t": time.time(), "branch": branch, "v": value}, f)
+        os.replace(tmp, path)
+    except OSError:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+
+
+def _pr_from_gh_output(path):
+    """Parse `gh pr view --json number,url` output; None when unusable
+    (no PR for the branch, gh failed, or the file is still in flight)."""
+    try:
+        with open(path, encoding="utf-8") as f:
+            pr = json.load(f)
+        number = int(pr["number"])
+        url = pr["url"]
+        if not isinstance(url, str):
+            return None
+        return {"number": number, "url": url}
+    except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError):
+        return None
+
+
+def _spawn_pr_lookup(cwd, out):
+    """Fire `gh pr view` detached with stdout aimed at `out`; the result
+    is adopted by a later run. gh needs a network round trip (upstream
+    allows it 5s) — far beyond the 300ms command budget, so it is never
+    waited on here. A killed run changes nothing: the detached gh still
+    lands its answer for the next refresh."""
+    gh = _gh_path()
+    if gh is None:
+        return
+    import subprocess
+    kw = ({"creationflags": 0x08000000} if os.name == "nt"
+          else {"start_new_session": True})
+    env = dict(os.environ, GH_NO_UPDATE_NOTIFIER="1", GH_PROMPT_DISABLED="1")
+    try:
+        f = open(out, "wb")
+        try:
+            subprocess.Popen([gh, "pr", "view", "--json", "number,url"],
+                             cwd=cwd, stdin=subprocess.DEVNULL, stdout=f,
+                             stderr=subprocess.DEVNULL, close_fds=True,
+                             env=env, **kw)
+        finally:
+            f.close()
+    except OSError:
+        pass
+
+
+@_memo
+def pr_status(cwd, branch):
+    """{"number", "url"} of the branch's open PR, or None.
+
+    Like upstream's async PR cache, the stale value keeps rendering until
+    the detached lookup lands. The cache timestamp is rewritten before
+    spawning, so the once-per-minute refresh rate holds even with several
+    runs in flight (a rare overlap just spawns a stray extra gh). A cached
+    value is only valid for the branch it was fetched on, and the side
+    file's name carries the branch hash so an answer for yesterday's
+    branch is never adopted."""
+    path = _pr_cache_path(cwd)
+    bhash = hashlib.sha256(branch.encode("utf-8")).hexdigest()[:8]
+    out = f"{path}.{bhash}.out"
+    cached = _read_pr_cache(path)
+    if cached is not None and cached.get("branch") != branch:
+        cached = None
+    value = cached.get("v") if cached else None
+    try:
+        finished = os.path.getmtime(out)
+    except OSError:
+        finished = None
+    if finished is not None:
+        v = _pr_from_gh_output(out)
+        # gh writes its one-line JSON as it exits, so parseable means the
+        # answer landed; an old unparseable file means the lookup failed
+        # (no PR, gh error, killed). A young unparseable file is gh still
+        # in flight — leave it and the cache alone.
+        done = v is not None or time.time() - finished > 30
+        if done:
+            if cached is None or finished >= cached.get("t", 0):
+                value = v
+                _write_pr_cache(path, branch, value)
+            try:
+                os.unlink(out)   # fails harmlessly while gh holds it open
+            except OSError:
+                pass
+            if cached is None or finished >= cached.get("t", 0):
+                return value
+    if cached is not None \
+            and time.time() - cached.get("t", 0) < _PR_CACHE_TTL:
+        return value
+    _write_pr_cache(path, branch, value)     # herd guard, see docstring
+    _spawn_pr_lookup(cwd, out)
+    return value
+
+
 def shorten_cwd(path):
     """Mirror the built-in footer's shortenCwd: '~' for home, otherwise the
     last 3 segments as '…/a/b/c'."""
@@ -1189,20 +1443,23 @@ def shorten_cwd(path):
 
 
 def prefix_line(payload, display_names, swarm_on, effort,
-                with_cwd=True, with_git=True, session_dir=None):
+                with_cwd=True, with_git=True, session_dir=None,
+                goal_observed=None):
     """Rebuilt on every run (not cached). Reproduces the built-in footer
     line 1 slots in the original order and spacing (two-space
     separated): mode badges (bare words, only when active), goal badge,
     model display_name with thinking-effort suffix (rainbow-painted
     while /dance is on), background task badges, shortened cwd, git
-    branch with dirty/ahead/behind stats. with_cwd / with_git drop
-    those slots for narrow terminals.
+    branch with dirty/ahead/behind stats and PR badge. with_cwd /
+    with_git drop those slots for narrow terminals.
 
     swarm state and effort come from the session wire log, /dance state
     from the input history, goal/task badges from the session's
-    state.json and task records, git stats from a TTL-cached probe
-    (the TUI snapshot omits all of these); rotating tips and the PR
-    badge are not reproduced."""
+    state.json and task records, git stats and the PR badge from
+    TTL-cached probes (the TUI snapshot omits all of these); only the
+    rotating tips are skipped, which upstream never renders next to a
+    custom line either. goal_observed is the wall-clock anchor for a
+    live goal badge (see goal_badge)."""
     parts = []
     modes = []
     perm = payload.get("permissionMode") or ""
@@ -1217,7 +1474,7 @@ def prefix_line(payload, display_names, swarm_on, effort,
     if modes:
         parts.append(" ".join(modes))
     if session_dir:
-        badge = goal_badge(session_dir)
+        badge = goal_badge(session_dir, goal_observed)
         if badge:
             parts.append(badge)
     model = payload.get("model") or ""
@@ -1236,9 +1493,11 @@ def prefix_line(payload, display_names, swarm_on, effort,
             # The TUI throttles status-line runs to ~1/s, so we can't
             # replay upstream's 110ms frames. Stepping the phase by one
             # palette slot per run turns the same refresh cadence into a
-            # slow gliding wave instead of a 9-slot jump each second.
-            # "on" holds a static rainbow, same as upstream's freeze.
-            phase = int(time.time()) if dance == "flow" else 0
+            # slow gliding wave instead of a ~9-slot jump each second.
+            # The hold freezes at the phase upstream's 3s flow lands on
+            # (3000ms / 110ms ≈ 27), same as upstream's settle(hold).
+            phase = (int(time.time()) if dance == "flow"
+                     else int(_DANCE_FLOW_S * 1000 / 110))
             label = _rainbow_text(label, phase, _dance_palette())
         parts.append(label)
     if session_dir:
@@ -1248,8 +1507,18 @@ def prefix_line(payload, display_names, swarm_on, effort,
         parts.append(_paint(cwd, "2"))
     branch = payload.get("gitBranch") if with_git else None
     if branch:
-        branch = git_badge(branch, git_status(payload.get("cwd") or ""))
-        parts.append(_paint(branch, "2"))
+        workdir = payload.get("cwd") or ""
+        status = git_status(workdir)
+        slot = _paint(git_badge(branch, status), "2")
+        if status is not None:
+            # The PR badge belongs to the git slot: painted in the theme's
+            # primary color (approximated by cyan here) and hyperlinked,
+            # same as upstream's formatFooterGitBadge.
+            pr = pr_status(workdir, branch)
+            if pr:
+                slot += " " + _paint(
+                    _hyperlink(f"[PR#{pr['number']}]", pr["url"]), "36")
+        parts.append(slot)
     return "  ".join(parts)
 
 
@@ -1287,7 +1556,7 @@ def _load_cache(session_id):
 
 
 def _save_cache(session_id, session_total, sub_by_model, swarm_on, effort,
-                files):
+                files, goal_key=None, goal_observed=None):
     path = _cache_path(session_id)
     tmp = f"{path}.{os.getpid()}.tmp"
     try:
@@ -1295,7 +1564,9 @@ def _save_cache(session_id, session_total, sub_by_model, swarm_on, effort,
             json.dump({"v": _CACHE_VERSION,
                        "session_total": session_total,
                        "sub_by_model": sub_by_model, "swarm": swarm_on,
-                       "effort": effort, "files": files}, f)
+                       "effort": effort, "files": files,
+                       "goal_key": goal_key,
+                       "goal_seen_at": goal_observed}, f)
         os.replace(tmp, path)   # a run killed at the 300ms cap can't corrupt it
     except OSError:
         try:
@@ -1305,6 +1576,8 @@ def _save_cache(session_id, session_total, sub_by_model, swarm_on, effort,
 
 
 def main():
+    global _RUN_STARTED
+    _RUN_STARTED = time.monotonic()
     _debug("invoked")
     if plugin_disabled():
         # Exit non-zero: the TUI treats that as a failure and renders its own
@@ -1336,11 +1609,32 @@ def main():
     prior = _load_cache(session_id) if session_id else None
     session_total, sub_by_model, swarm_on, effort, files = \
         parse_session(session_dir, prior)
-    if session_id and files != (prior or {}).get("files"):
+
+    # Wall-clock anchor for a live goal badge, mirroring upstream's
+    # goalObservedAtMs: the moment this goal snapshot was first seen. The
+    # per-session cache carries it across runs; without a session id the
+    # badge falls back to the state file's mtime (see goal_badge).
+    goal_key = _goal_key(_goal_snapshot(session_dir))
+    goal_observed = None
+    if goal_key is not None and session_id:
+        seen = (prior or {}).get("goal_seen_at") \
+            if (prior or {}).get("goal_key") == goal_key else None
+        goal_observed = seen if isinstance(seen, (int, float)) \
+            else time.time()
+    # save once when the anchor is missing from an older cache, so the
+    # clock keeps accruing from first sight instead of resetting per run
+    anchor_unsaved = (goal_key is not None and session_id
+                      and (prior or {}).get("goal_key") == goal_key
+                      and not isinstance((prior or {}).get("goal_seen_at"),
+                                         (int, float)))
+
+    if session_id and (files != (prior or {}).get("files")
+                       or goal_key != (prior or {}).get("goal_key")
+                       or anchor_unsaved):
         _debug(f"swarm_on={swarm_on} effort={effort!r} "
                f"sub_models={list(sub_by_model)}")
         _save_cache(session_id, session_total, sub_by_model, swarm_on,
-                    effort, files)
+                    effort, files, goal_key, goal_observed)
 
     if effort is None:
         # No effort record in the wire yet (fresh session before the
@@ -1360,7 +1654,7 @@ def main():
         width = max(1, width - 2 * _CHROME_GUTTER)
     line = _fit_line(payload, session_total, sub_by_model,
                      model_display_names(), swarm_on, effort, width,
-                     session_dir=session_dir)
+                     session_dir=session_dir, goal_observed=goal_observed)
     _debug(f"width={width} line={line!r}")
     print(line)
 

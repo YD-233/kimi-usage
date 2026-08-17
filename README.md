@@ -10,7 +10,7 @@
 
 一行，`|` 分隔左右：
 
-- **左侧**：模式徽标（`yolo`/`auto`/`plan`/`swarm`，仅激活时显示）、goal 徽标（如 `[goal ● active · 4m · 7 turns]`）、当前模型与思考强度（如 `K3-256k thinking: high`，跟随 `/effort` 切换；`/dance` 开启时变成彩虹）、后台任务徽标（如 `[2 tasks running]`）、工作目录、git 分支与改动统计（如 `main [+12 -3 ↑1]`）——外观与内置状态栏一致
+- **左侧**：模式徽标（`yolo`/`auto`/`plan`/`swarm`，仅激活时显示）、goal 徽标（如 `[goal ● active · 4m · 7 turns]`）、当前模型与思考强度（如 `K3-256k thinking: high`，跟随 `/effort` 切换；`/dance` 开启时变成彩虹，流动几秒后定格，`/dance off` 关闭）、后台任务徽标（如 `[2 tasks running]`）、工作目录、git 分支与改动统计（如 `main [+12 -3 ↑1]`，当前分支有打开的 PR 时追加可点击的 `[PR#42]`，需安装 `gh`）——外观与内置状态栏一致
 - **右侧**：整会话（主 agent + 全部子 agent）的总输入 `↑`、总输出 `↓`、缓存命中率；有子 agent 时按模型各列一段同样三项，按输入量降序
 
 缓存命中率带健康渐变：低红高绿，95% 以上显示一位小数（如 `97.8%`），现代渠道常见的高缓存区间每一格都可分辨：
@@ -44,7 +44,7 @@
 
 - 已有自定义 `[status_line]` 段时：里面已有 `command` 的话插件**不会覆盖**（想换成本插件，把那行删掉，或指向 `plugins/managed/kimi-usage/scripts/statusline.py`）；只设了 `items` 的段落会被补上一行 `command`，两者并不冲突
 - 任何情况下都不会把 `tui.toml` 写坏：写入前会校验一遍，只要结果不是合法 TOML 就放弃（`kimi doctor tui` 可以自己复核）
-- 升级/指定版本：`/plugins install https://github.com/YD-233/kimi-usage/releases/tag/v1.4.3`
+- 升级/指定版本：`/plugins install https://github.com/YD-233/kimi-usage/releases/tag/v1.5.2`
 
 ## 卸载与恢复
 
@@ -54,7 +54,7 @@
 
 ## 调试
 
-状态栏命令失败时 TUI 会静默回退到内置布局。诊断日志写到 `~/.kimi-code/kimi-usage-debug.log`，两种开启方式：设 `KIMI_USAGE_DEBUG=1`（需重启 CLI），或 `touch ~/.kimi-code/kimi-usage-debug` 建一个开关文件（即时生效，删文件即关闭）。设 `KIMI_USAGE_NO_COLOR=1` 可输出纯文本。
+状态栏命令失败时 TUI 会保留上一次渲染的行（只有从没成功过才显示内置布局）。诊断日志写到 `~/.kimi-code/kimi-usage-debug.log`，两种开启方式：设 `KIMI_USAGE_DEBUG=1`（需重启 CLI），或 `touch ~/.kimi-code/kimi-usage-debug` 建一个开关文件（即时生效，删文件即关闭）。设 `KIMI_USAGE_NO_COLOR=1` 可输出纯文本。
 
 也可以手动喂一个 JSON 快照，直接看脚本输出：
 
