@@ -7,12 +7,20 @@ this hook merges one into <KIMI_CODE_HOME>/tui.toml:
 - idempotent: our managed block (delimited by marker comments) is created
   once and refreshed in place on later runs (e.g. after the plugin root
   moves on reinstall)
-- conservative: an existing user-defined [status_line] section is left
-  untouched, unless its command already points at a kimi-usage script
-  (then it is adopted and refreshed)
+- conservative: a [status_line] section the user already owns keeps its
+  own `command`; a section that only sets `items` (a complementary
+  setting) gets our command line added inside it, and a command that is
+  already ours is adopted and refreshed
+- safe: the result is checked before it replaces the live file — nothing
+  is written that would leave tui.toml unparseable, because the CLI then
+  falls back to default TUI preferences across the board
 - silent: prints nothing — hook stdout may be appended to model context
 - fail-open: any error is swallowed; set KIMI_USAGE_DEBUG=1 to log to
   <KIMI_CODE_HOME>/kimi-usage-debug.log
+
+`remove_block()` is the counterpart, called by the status line command
+itself once the plugin is disabled or removed (hooks stop at that point,
+so nothing else could clean up).
 
 The interpreter path is taken from sys.executable, so the status line
 always runs with the same Python that successfully ran this hook.
@@ -25,6 +33,18 @@ import time
 
 MARK_BEGIN = "# >>> kimi-usage"
 MARK_END = "# <<< kimi-usage"
+
+# A [status_line] header, tolerantly: TOML allows surrounding whitespace, a
+# quoted key and a trailing comment. Matching only the bare spelling used to
+# mean we appended a *second* [status_line] table, which makes the whole
+# file invalid TOML — and an invalid tui.toml drops every TUI preference
+# (theme, editor, notifications, auto-update) back to its default.
+SECTION_RE = re.compile(r'^\s*\[\s*"?status_line"?\s*\]\s*(#.*)?$')
+# Any other table header, used to find where a section ends. Requires the
+# whole line to be a header so an array continuation line ("x", …] does not
+# count as one.
+ANY_SECTION_RE = re.compile(r'^\s*\[[^\]]*\]\s*(#.*)?$')
+COMMAND_RE = re.compile(r'(?m)^\s*command\s*=\s*(.+)$')
 
 
 def kimi_home():
@@ -92,79 +112,170 @@ def toml_quote(value):
     return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
 
 
-def build_block():
+def build_block(with_header=True):
+    """Our managed block.
+
+    Standalone it carries the [status_line] header; merged into a section the
+    user already owns it is just the command line, because a second header
+    would redefine the table and break the file.
+    """
+    body = f"command = {toml_quote(statusline_command())}\n"
+    if with_header:
+        body = "[status_line]\n" + body
     return (
         f"{MARK_BEGIN} auto-configured; delete these two marker lines and"
         f" everything between them to remove\n"
-        f"[status_line]\n"
-        f"command = {toml_quote(statusline_command())}\n"
+        f"{body}"
         f"{MARK_END}\n"
     )
 
 
-def find_active_section(lines, name):
-    """Return [start, end) of the first uncommented [<name>] section, or None."""
-    header = f"[{name}]"
-    start = None
-    for i, line in enumerate(lines):
-        s = line.strip()
-        if not s or s.startswith("#"):
-            continue
-        if s == header:
-            start = i
-            break
-    if start is None:
-        return None
-    end = len(lines)
+def find_sections(lines):
+    """Line indices of every [status_line] header."""
+    return [i for i, line in enumerate(lines) if SECTION_RE.match(line)]
+
+
+def section_end(lines, start):
+    """Index of the line that ends the section opened at `start`."""
     for j in range(start + 1, len(lines)):
-        s = lines[j].strip()
-        if s.startswith("[") and not s.startswith("#"):
-            end = j
-            break
-    return start, end
+        if ANY_SECTION_RE.match(lines[j]):
+            return j
+    return len(lines)
+
+
+def marker_span(text):
+    """(start, end) of our managed block in `text`, or None."""
+    if MARK_BEGIN not in text or MARK_END not in text:
+        return None
+    m = re.search(
+        re.escape(MARK_BEGIN) + r".*?" + re.escape(MARK_END) + r"\n?",
+        text, re.S)
+    if m is None:       # markers present but in the wrong order
+        _debug("marker block malformed (END before BEGIN)")
+        return None
+    return m.start(), m.end()
+
+
+def validated(candidate):
+    """Return `candidate` only if it is a usable tui.toml, else None.
+
+    Writing a file the CLI cannot parse is never a win: it would silently
+    reset the user's theme, editor, notification and auto-update settings.
+    """
+    if len(find_sections(candidate.splitlines())) > 1:
+        _debug("candidate has more than one [status_line] table, not writing")
+        return None
+    try:
+        import tomllib          # 3.11+; older Pythons keep the check above
+    except ImportError:
+        return candidate
+    try:
+        tomllib.loads(candidate)
+    except Exception as e:
+        _debug(f"candidate is not valid TOML ({e}), not writing")
+        return None
+    return candidate
+
+
+def is_our_command(value):
+    """Whether a [status_line].command already points at this plugin.
+
+    8.3 short names mangle "kimi-usage" into "KIMI-U~N", and the ~N
+    numbering shifts as sibling plugin dirs come and go, so a stale short
+    name must still be recognized as ours.
+    """
+    cmd = value.lower()
+    return ("kimi-usage" in cmd or "kimi-u~" in cmd
+            or "statusline.py" in cmd or "status~" in cmd)
 
 
 def merge(text):
     """Return the new tui.toml content, or None when nothing should change."""
-    block = build_block()
-
-    if MARK_BEGIN in text and MARK_END in text:
-        pattern = re.compile(
-            re.escape(MARK_BEGIN) + r".*?" + re.escape(MARK_END) + r"\n?",
-            re.S,
-        )
-        if pattern.search(text).group(0) == block:
-            return None  # already up to date
-        return pattern.sub(lambda _: block, text)
-
     lines = text.splitlines()
-    sec = find_active_section(lines, "status_line")
-    if sec is not None:
-        start, end = sec
-        m = re.search(r"(?m)^\s*command\s*=\s*(.+)$",
-                      "\n".join(lines[start:end]))
-        # Recognize our own command even when 8.3 short names mangled
-        # "kimi-usage" into "KIMI-U~N" (the ~N numbering shifts as sibling
-        # plugin dirs come and go, so a stale short name must still match).
-        cmd = m.group(1).lower() if m else ""
-        if "kimi-usage" in cmd or "kimi-u~" in cmd or "statusline.py" in cmd \
-                or "status~" in cmd:
-            # our own command from a manual/older setup: adopt and refresh
-            new_lines = lines[:start] + block.splitlines() + lines[end:]
-            return "\n".join(new_lines) + "\n"
-        _debug("user-defined [status_line] found, leaving it untouched")
+
+    span = marker_span(text)
+    if span is not None:
+        # refresh our own block in place, keeping its shape: a block that
+        # sits inside a section the user owns must not repeat the header
+        start, end = span
+        current = text[start:end]
+        block = build_block(
+            any(SECTION_RE.match(l) for l in current.splitlines()))
+        if current == block:
+            return None
+        return validated(text[:start] + block + text[end:])
+
+    sections = find_sections(lines)
+    if len(sections) > 1:
+        _debug("multiple [status_line] tables, leaving the file alone")
+        return None
+
+    if sections:
+        start = sections[0]
+        end = section_end(lines, start)
+        tail = end
+        while tail > start + 1 and not lines[tail - 1].strip():
+            tail -= 1       # keep the blank lines that follow the section
+        m = COMMAND_RE.search("\n".join(lines[start:end]))
+        if m is None:
+            # The user's section has no command (e.g. only `items`, which is
+            # a complementary setting, not an alternative). Add ours inside
+            # it: giving up here used to leave the plugin permanently
+            # unconfigured with nothing but a debug-log line to show why.
+            new_lines = (lines[:tail] + build_block(False).splitlines()
+                         + lines[tail:])
+            return validated("\n".join(new_lines) + "\n")
+        if is_our_command(m.group(1)):
+            # our own command from a manual or older setup: adopt and refresh
+            new_lines = lines[:start] + build_block(True).splitlines() \
+                + lines[tail:]
+            return validated("\n".join(new_lines) + "\n")
+        _debug("user-defined [status_line].command found, leaving it untouched")
         return None
 
     sep = "" if not text or text.endswith("\n") else "\n"
     pad = "\n" if text.strip() else ""
-    return text + sep + pad + block
+    return validated(text + sep + pad + build_block(True))
+
+
+def remove_block():
+    """Delete our managed block from tui.toml (idempotent).
+
+    Disabling or removing a plugin stops its hooks but leaves the managed
+    copy and this command on disk, so nothing else is left to clean up after
+    us — the status line command calls this when it notices the plugin is
+    gone.
+    """
+    path = os.path.join(kimi_home(), "tui.toml")
+    try:
+        with open(path, encoding="utf-8") as f:
+            text = f.read()
+    except OSError:
+        return
+    span = marker_span(text)
+    if span is None:
+        return
+    new_text = validated(text[:span[0]] + text[span[1]:])
+    if new_text is None or new_text == text:
+        return
+    write_atomic(path, new_text)
+    _debug(f"managed block removed from {path}")
 
 
 def write_atomic(path, text):
-    tmp = path + ".kimi-usage-tmp"
-    with open(tmp, "w", encoding="utf-8", newline="") as f:
-        f.write(text)
-    os.replace(tmp, path)
+    tmp = f"{path}.kimi-usage-{os.getpid()}.tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8", newline="") as f:
+            f.write(text)
+        os.replace(tmp, path)
+    except OSError:
+        # a read-only tui.toml (or one replaced by a directory) must not
+        # leave the temp file behind; the pid keeps concurrent hooks apart
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
 
 
 def main():

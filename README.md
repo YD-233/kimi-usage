@@ -42,13 +42,15 @@
 
 然后新开一个会话（`/new`）或重启 CLI，再执行 `/reload-tui`（或等下次启动），底部状态栏即开始显示。
 
-- 已有自定义 `[status_line]` 段时插件**不会覆盖**；想换成本插件，把该段的 `command` 删掉或指向 `plugins/managed/kimi-usage/scripts/statusline.py` 即可
+- 已有自定义 `[status_line]` 段时：里面已有 `command` 的话插件**不会覆盖**（想换成本插件，把那行删掉，或指向 `plugins/managed/kimi-usage/scripts/statusline.py`）；只设了 `items` 的段落会被补上一行 `command`，两者并不冲突
+- 任何情况下都不会把 `tui.toml` 写坏：写入前会校验一遍，只要结果不是合法 TOML 就放弃（`kimi doctor tui` 可以自己复核）
 - 升级/指定版本：`/plugins install https://github.com/YD-233/kimi-usage/releases/tag/v1.4.3`
 
 ## 卸载与恢复
 
-- 卸载：`/plugins remove kimi-usage`
-- 恢复内置状态栏：禁用插件，或删掉 `~/.kimi-code/tui.toml` 里 `# >>> kimi-usage` / `# <<< kimi-usage` 两条标记之间的块
+- 卸载：`/plugins remove kimi-usage`；禁用：`/plugins disable kimi-usage`
+- 两者都会自动让位：状态栏脚本发现自己已被禁用或移除后，会退出并把 `tui.toml` 里那段自己写进去的块删掉，底栏恢复成内置布局。当前会话的底栏可能还停在最后一次渲染的内容上（TUI 不会因命令失败而清掉上一次的结果），执行一次 `/reload-tui` 或开新会话即可
+- 也可以手动删：`~/.kimi-code/tui.toml` 里 `# >>> kimi-usage` / `# <<< kimi-usage` 两条标记之间的块
 
 ## 调试
 

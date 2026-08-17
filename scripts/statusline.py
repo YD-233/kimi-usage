@@ -142,6 +142,48 @@ def _debug(msg):
         pass
 
 
+_PLUGIN_ID = "kimi-usage"
+
+
+def plugin_disabled():
+    """Whether this managed plugin copy has been disabled or removed.
+
+    `/plugins disable` only stops the plugin's hooks and `/plugins remove`
+    only drops its record — the managed copy and the tui.toml command both
+    stay on disk, so without this check the status line keeps rendering long
+    after the user thought they had turned it off.
+
+    Only a copy living under plugins/managed/ polices itself: a dev checkout
+    or a hand-written [status_line].command has no plugin record to consult
+    and must keep working. An unreadable installed.json fails open.
+    """
+    here = os.path.normcase(os.path.abspath(__file__))
+    if os.path.normcase(os.path.join("plugins", "managed")) not in here:
+        return False
+    try:
+        with open(os.path.join(kimi_home(), "plugins", "installed.json"),
+                  encoding="utf-8") as f:
+            records = json.load(f).get("plugins")
+    except (OSError, json.JSONDecodeError, AttributeError):
+        return False
+    if not isinstance(records, list):
+        return False
+    for rec in records:
+        if isinstance(rec, dict) and rec.get("id") == _PLUGIN_ID:
+            return not rec.get("enabled", True)
+    return True     # no record left: the plugin was removed
+
+
+def restore_builtin_statusline():
+    """Take our command out of tui.toml so the TUI stops spawning us."""
+    try:
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        import setup_statusline
+        setup_statusline.remove_block()
+    except Exception as e:
+        _debug(f"could not remove the tui.toml block: {e}")
+
+
 def _read_stdin_json(timeout=0.18):
     """Read the JSON snapshot from stdin; return {} on any failure.
 
@@ -1264,6 +1306,13 @@ def _save_cache(session_id, session_total, sub_by_model, swarm_on, effort,
 
 def main():
     _debug("invoked")
+    if plugin_disabled():
+        # Exit non-zero: the TUI treats that as a failure and renders its own
+        # footer again, which is exactly what a disabled plugin should leave
+        # behind.
+        _debug("plugin disabled or removed; restoring the built-in footer")
+        restore_builtin_statusline()
+        sys.exit(1)
     payload = _read_stdin_json()
     _debug(f"payload keys={list(payload.keys())}")
     session_id = payload.get("sessionId") or payload.get("session_id")
