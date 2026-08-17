@@ -1,6 +1,6 @@
 {
   "name": "kimi-usage",
-  "version": "1.4.5",
+  "version": "1.5.0",
   "description": "在 TUI 底部状态栏显示当前会话的 token 总输入、总输出与缓存命中率，并按模型汇总子 Agent 用量；安装后自动配置状态栏，无需手改 tui.toml（需要 kimi-code ≥ 0.30.0）",
   "interface": {
     "displayName": "Kimi 用量统计",

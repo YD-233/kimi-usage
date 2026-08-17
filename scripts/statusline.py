@@ -18,6 +18,14 @@ cwd leave the prefix, the "总计："/"缓存" labels drop, " · " tightens,
 sub-agent columns fall from the smallest consumer, and only as a last
 resort the line is cut with an ellipsis.
 
+The custom line replaces the built-in footer line 1 entirely, so the
+built-in slots that would otherwise vanish are reproduced here: mode
+badges, goal badge, model + thinking effort (tracked from the wire's
+llm.request / profile.bind records, which follow /effort switches),
+background task badges, cwd, git branch — and the /dance easter egg's
+rainbow model label (detected from the per-cwd input history, where
+/dance commands are recorded).
+
 Fail-open by design: any error prints a fallback indicator so the user can
 see something is wrong, rather than silently falling back to the built-in
 layout. Set KIMI_USAGE_DEBUG=1 to append diagnostics to
@@ -193,7 +201,8 @@ def iter_usage_records(path):
     """Yield (kind, record) for lines worth parsing.
 
     Cheap substring pre-filter keeps this fast on multi-MB wire files:
-    only usage.record / profile.bind / swarm_mode lines are JSON-decoded.
+    only usage.record / profile.bind / config.update / llm.request /
+    swarm_mode lines are JSON-decoded.
     """
     try:
         with open(path, encoding="utf-8") as f:
@@ -204,6 +213,10 @@ def iter_usage_records(path):
                     kind = "profile.bind"
                 elif '"swarm_mode.' in line:
                     kind = "swarm"
+                elif '"type":"llm.request"' in line:
+                    kind = "llm.request"
+                elif '"type":"config.update"' in line:
+                    kind = "config.update"
                 else:
                     continue
                 try:
@@ -222,8 +235,11 @@ def parse_session(session_dir):
     sub_by_model:  {model: usage} aggregated over sub-agent wires only.
     swarm_on:      state of the last swarm_mode op persisted in the main
     wire (swarm mode is a wire Model, so the log is authoritative).
-    effort:        thinkingEffort of the latest profile.bind in the main
-    wire (rebound on every request, so it tracks /effort switches).
+    effort:        thinkingEffort of the latest effort-bearing record in
+    the main wire. profile.bind is only written on (re)bind, so the
+    freshest source is llm.request (written on every model request);
+    config.update covers the legacy engine. This tracks /effort
+    switches as soon as the next request goes out.
     """
     session_total = empty_usage()
     sub_by_model = {}
@@ -243,7 +259,15 @@ def parse_session(session_dir):
             if kind == "profile.bind":
                 bound_model = rec.get("modelAlias") or bound_model
                 if is_main:
-                    effort = rec.get("thinkingEffort", effort)
+                    effort = rec.get("thinkingEffort",
+                                     rec.get("thinkingLevel", effort))
+                continue
+            if kind in ("llm.request", "config.update"):
+                if is_main:
+                    e = rec.get("thinkingEffort",
+                                rec.get("thinkingLevel"))
+                    if e is not None:
+                        effort = e
                 continue
             u = {k: int(rec.get("usage", {}).get(k, 0) or 0)
                  for k in session_total}
@@ -540,7 +564,7 @@ def _terminal_width(payload):
 
 
 def _fit_line(payload, session_total, sub_by_model, display_names,
-              swarm_on, effort, width):
+              swarm_on, effort, width, session_dir=None):
     """Render prefix + stats to fit `width` columns by graceful
     degradation, cheapest losses first: unit "token" -> "tok" ->
     dropped, git branch dropped, cwd dropped, the "总计：" and "缓存"
@@ -570,7 +594,8 @@ def _fit_line(payload, session_total, sub_by_model, display_names,
         if not with_prefix:
             return usage
         p = prefix_line(payload, display_names, swarm_on, effort,
-                        with_cwd=o["with_cwd"], with_git=o["with_git"])
+                        with_cwd=o["with_cwd"], with_git=o["with_git"],
+                        session_dir=session_dir)
         return f"{p} | {usage}" if p else usage
 
     opts = dict(base)
@@ -613,6 +638,298 @@ def _paint(text, code):
     return f"\x1b[{code}m{text}\x1b[0m"
 
 
+# --------------------------------------------------------------------------
+# /dance easter egg (rainbow model label)
+# --------------------------------------------------------------------------
+
+# Palettes from upstream src/tui/easter-eggs/dance.ts.
+_DARK_RAINBOW = ["#4FA8FF", "#5BC0BE", "#4EC87E", "#E8A838",
+                 "#FFCB6B", "#C678B8", "#A274D9", "#7C8DFF"]
+_LIGHT_RAINBOW = ["#1565C0", "#00838F", "#0E7A38", "#92660A", "#9A4A00",
+                  "#B91C1C", "#8A3A75", "#6B3A9A", "#354CB5"]
+_DANCE_FRAME_S = 0.110   # upstream DANCE_FRAME_MS = 110
+_DANCE_FLOW_S = 3.0      # upstream DANCE_FLOW_MS = 3000
+
+
+def _dance_palette():
+    """Light palette only for an explicit light theme; dark otherwise
+    (upstream picks by theme text color, which we can't see)."""
+    try:
+        with open(os.path.join(kimi_home(), "tui.toml"),
+                  encoding="utf-8") as f:
+            if re.search(r'(?m)^\s*theme\s*=\s*"light"', f.read()):
+                return _LIGHT_RAINBOW
+    except OSError:
+        pass
+    return _DARK_RAINBOW
+
+
+def _rainbow_text(text, phase, palette):
+    """Paint text char-by-char through the palette, skipping spaces —
+    a byte-for-byte port of upstream rainbowText(), as 24-bit SGR."""
+    if not text or not _colors_on():
+        return text
+    out, i = [], phase
+    for ch in text:
+        if ch == " ":
+            out.append(ch)
+            continue
+        hexc = palette[i % len(palette)]
+        i += 1
+        r, g, b = (int(hexc[j:j + 2], 16) for j in (1, 3, 5))
+        out.append(f"\x1b[38;2;{r};{g};{b}m{ch}\x1b[0m")
+    return "".join(out)
+
+
+def _history_path(cwd):
+    """Per-cwd input history: <home>/user-history/md5(cwd).jsonl. The TUI
+    hashes its own workDir spelling, so try the likely variants."""
+    if not cwd:
+        return None
+    variants = [cwd, cwd.replace("/", "\\"), cwd.replace("\\", "/"),
+                os.path.normpath(cwd)]
+    seen = set()
+    for v in variants:
+        if v in seen:
+            continue
+        seen.add(v)
+        p = os.path.join(kimi_home(), "user-history",
+                         hashlib.md5(v.encode("utf-8")).hexdigest()
+                         + ".jsonl")
+        if os.path.isfile(p):
+            return p
+    return None
+
+
+def dance_state(cwd):
+    """Reproduce the /dance easter egg state from the input history, where
+    every submitted slash command is recorded. Returns "on" (hold),
+    "flow" (within the ~3s flow window), or None. Only the last dance
+    command matters: "/dance on" holds, "/dance off" clears, and a bare
+    "/dance" flows for DANCE_FLOW_S then fades — the flow window is
+    reckoned from the history file's mtime, since entries carry no
+    timestamp of their own."""
+    path = _history_path(cwd)
+    if not path:
+        return None
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            size = f.tell()
+            f.seek(max(0, size - 8192))
+            tail = f.read().decode("utf-8", "ignore")
+        last = None
+        for line in tail.splitlines():
+            if "dance" not in line:
+                continue
+            try:
+                content = json.loads(line).get("content") or ""
+            except json.JSONDecodeError:
+                continue
+            content = content.strip()
+            if content == "/dance on":
+                last = "on"
+            elif content == "/dance off":
+                last = None
+            elif content == "/dance" or content.startswith("/dance "):
+                last = "flow"
+        if last == "on":
+            return "on"
+        if last == "flow":
+            age = time.time() - os.path.getmtime(path)
+            if age <= _DANCE_FLOW_S + 0.5:
+                return "flow"
+    except OSError:
+        pass
+    return None
+
+
+# --------------------------------------------------------------------------
+# goal badge and background-task badges
+# --------------------------------------------------------------------------
+
+def goal_badge(session_dir):
+    """[goal ● active · 4m · 7 turns] from state.json's reserved custom
+    metadata key "goal" (a goalSnapshot: status, turnsUsed, wallClockMs,
+    budget). Only live (active/paused/blocked) goals get a badge, same
+    as the built-in footer."""
+    try:
+        state_path = os.path.join(session_dir, "state.json")
+        with open(state_path, encoding="utf-8") as f:
+            goal = (json.load(f).get("custom") or {}).get("goal")
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(goal, dict):
+        return None
+    status = goal.get("status")
+    if status not in ("active", "paused", "blocked"):
+        return None
+    turns_used = int(goal.get("turnsUsed", 0) or 0)
+    turn_budget = (goal.get("budget") or {}).get("turnBudget")
+    if turn_budget is not None:
+        turns = f"{turns_used}/{turn_budget} turns"
+    else:
+        turns = f"{turns_used} " + ("turn" if turns_used == 1 else "turns")
+    wall_ms = float(goal.get("wallClockMs", 0) or 0)
+    if status == "active":
+        # Live goals keep ticking; upstream adds wall time observed since
+        # the last snapshot, we approximate with the state file's age.
+        try:
+            wall_ms += max(0.0, (time.time()
+                                 - os.path.getmtime(state_path)) * 1000)
+        except OSError:
+            pass
+    secs = int(round(wall_ms / 1000.0))
+    if secs < 60:
+        elapsed = f"{secs}s"
+    elif secs < 3600:
+        elapsed = f"{secs // 60}m"
+    else:
+        elapsed = f"{secs // 3600}h{secs % 3600 // 60}m"
+    dot = {"active": "36", "blocked": "33", "paused": "2"}[status]
+    return (_paint("[goal ", "2") + _paint("●", dot)
+            + _paint(f" {status} · {elapsed} · {turns}]", "2"))
+
+
+def task_badges(session_dir):
+    """[N tasks running] / [N agents running] from the per-agent task
+    records (agents/*/tasks/<id>.json). bash-* ids are shell tasks,
+    agent-* ids are background sub-agents; only "running" counts."""
+    bash_n = agent_n = 0
+    for tf in glob.glob(os.path.join(session_dir, "agents", "*", "tasks",
+                                     "*.json")):
+        name = os.path.basename(tf)
+        if name.startswith("bash-"):
+            kind = "bash"
+        elif name.startswith("agent-"):
+            kind = "agent"
+        else:
+            continue
+        try:
+            with open(tf, encoding="utf-8") as f:
+                if json.load(f).get("status") != "running":
+                    continue
+        except (OSError, json.JSONDecodeError):
+            continue
+        if kind == "bash":
+            bash_n += 1
+        else:
+            agent_n += 1
+    badges = []
+    if bash_n:
+        noun = "task" if bash_n == 1 else "tasks"
+        badges.append(_paint(f"[{bash_n} {noun} running]", "36"))
+    if agent_n:
+        noun = "agent" if agent_n == 1 else "agents"
+        badges.append(_paint(f"[{agent_n} {noun} running]", "36"))
+    return badges
+
+
+# --------------------------------------------------------------------------
+# git working-tree status (dirty / ahead / behind / diff stats)
+# --------------------------------------------------------------------------
+
+_GIT_CACHE_TTL = 15.0   # mirrors upstream STATUS_TTL_MS
+
+
+def _git_cache_path(cwd):
+    base = os.path.join(kimi_home(), "kimi-usage-cache")
+    safe = hashlib.sha256(cwd.encode("utf-8")).hexdigest()[:16]
+    return os.path.join(base, f"git-{safe}.json")
+
+
+def _probe_git(cwd):
+    """One refresh of the git badge data. Two short-timeout spawns;
+    any failure yields None and the caller keeps the stale cache."""
+    import subprocess
+    # hide the console windows git would otherwise flash on Windows
+    kw = {"creationflags": 0x08000000} if os.name == "nt" else {}
+    try:
+        st = subprocess.run(
+            ["git", "status", "--porcelain=v1", "--branch"],
+            cwd=cwd, capture_output=True, text=True, timeout=0.15, **kw)
+        if st.returncode != 0:
+            return None
+        dirty, ahead, behind = False, 0, 0
+        for line in st.stdout.splitlines():
+            if line.startswith("##"):
+                m = re.search(r"ahead (\d+)", line)
+                if m:
+                    ahead = int(m.group(1))
+                m = re.search(r"behind (\d+)", line)
+                if m:
+                    behind = int(m.group(1))
+            elif line:
+                dirty = True
+        added = deleted = 0
+        if dirty:
+            ns = subprocess.run(
+                ["git", "diff", "--numstat", "HEAD"],
+                cwd=cwd, capture_output=True, text=True, timeout=0.15, **kw)
+            if ns.returncode == 0:
+                for line in ns.stdout.splitlines():
+                    parts = line.split("\t")
+                    if len(parts) >= 2:
+                        if parts[0].isdigit():
+                            added += int(parts[0])
+                        if parts[1].isdigit():
+                            deleted += int(parts[1])
+        return {"dirty": dirty, "ahead": ahead, "behind": behind,
+                "added": added, "deleted": deleted}
+    except Exception:
+        return None
+
+
+def git_status(cwd):
+    """(dirty, ahead, behind, added, deleted) with a TTL file cache, so
+    the 300ms command budget only pays for git spawns once per 15s."""
+    path = _git_cache_path(cwd)
+    cached = None
+    try:
+        with open(path, encoding="utf-8") as f:
+            c = json.load(f)
+        cached = c
+        if time.time() - c.get("t", 0) < _GIT_CACHE_TTL:
+            return c.get("v")
+    except (OSError, json.JSONDecodeError):
+        pass
+    v = _probe_git(cwd)
+    if v is None and cached is not None:
+        return cached.get("v")  # keep stale data on probe failure
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump({"t": time.time(), "v": v}, f)
+    except OSError:
+        pass
+    return v
+
+
+def git_badge(branch, status):
+    """branch [+a -d ↑x ↓y], mirroring upstream formatGitBadgeBase.
+    The PR badge is not reproduced (needs a gh call)."""
+    if not status:
+        return branch
+    parts = []
+    if status.get("added") or status.get("deleted"):
+        diff = []
+        if status.get("added"):
+            diff.append(f"+{status['added']}")
+        if status.get("deleted"):
+            diff.append(f"-{status['deleted']}")
+        parts.append(" ".join(diff))
+    elif status.get("dirty"):
+        parts.append("±")
+    sync = ""
+    if status.get("ahead"):
+        sync += f"↑{status['ahead']}"
+    if status.get("behind"):
+        sync += f"↓{status['behind']}"
+    if sync:
+        parts.append(sync)
+    return f"{branch} [{' '.join(parts)}]" if parts else branch
+
+
 def shorten_cwd(path):
     """Mirror the built-in footer's shortenCwd: '~' for home, otherwise the
     last 3 segments as '…/a/b/c'."""
@@ -633,18 +950,20 @@ def shorten_cwd(path):
 
 
 def prefix_line(payload, display_names, swarm_on, effort,
-                with_cwd=True, with_git=True):
+                with_cwd=True, with_git=True, session_dir=None):
     """Rebuilt on every run (not cached). Reproduces the built-in footer
-    line 1 slots that the TUI snapshot exposes, in the original order and
-    spacing (two-space separated): mode badges (bare words, only when
-    active), model display_name with thinking-effort suffix, shortened
-    cwd, git branch. with_cwd / with_git drop those slots for narrow
-    terminals (cwd is the longest and least load-bearing, so it goes
-    first).
+    line 1 slots in the original order and spacing (two-space
+    separated): mode badges (bare words, only when active), goal badge,
+    model display_name with thinking-effort suffix (rainbow-painted
+    while /dance is on), background task badges, shortened cwd, git
+    branch with dirty/ahead/behind stats. with_cwd / with_git drop
+    those slots for narrow terminals.
 
-    swarm state and effort come from the session wire log (the TUI
-    snapshot omits both); goal/tasks badges, rotating tips and git diff
-    stats are not reproducible."""
+    swarm state and effort come from the session wire log, /dance state
+    from the input history, goal/task badges from the session's
+    state.json and task records, git stats from a TTL-cached probe
+    (the TUI snapshot omits all of these); rotating tips and the PR
+    badge are not reproduced."""
     parts = []
     modes = []
     perm = payload.get("permissionMode") or ""
@@ -658,6 +977,10 @@ def prefix_line(payload, display_names, swarm_on, effort,
         modes.append(_paint("swarm", "36;1"))
     if modes:
         parts.append(" ".join(modes))
+    if session_dir:
+        badge = goal_badge(session_dir)
+        if badge:
+            parts.append(badge)
     model = payload.get("model") or ""
     if model:
         label = display_names.get(model) or short_model(model)
@@ -669,12 +992,22 @@ def prefix_line(payload, display_names, swarm_on, effort,
             label += f" thinking: {effort}"
         elif effort == "on":
             label += " thinking"
+        dance = dance_state(payload.get("cwd") or "")
+        if dance:
+            # /dance: flow animates by wall clock (one frame per 110ms);
+            # "on" holds a static rainbow, same as upstream's freeze.
+            phase = (int(time.time() / _DANCE_FRAME_S)
+                     if dance == "flow" else 0)
+            label = _rainbow_text(label, phase, _dance_palette())
         parts.append(label)
+    if session_dir:
+        parts.extend(task_badges(session_dir))
     cwd = shorten_cwd(payload.get("cwd") or "") if with_cwd else ""
     if cwd:
         parts.append(_paint(cwd, "2"))
     branch = payload.get("gitBranch") if with_git else None
     if branch:
+        branch = git_badge(branch, git_status(payload.get("cwd") or ""))
         parts.append(_paint(branch, "2"))
     return "  ".join(parts)
 
@@ -764,12 +1097,19 @@ def main():
             _save_cache(session_dir, session_id, session_total,
                         sub_by_model, swarm_on, effort)
 
+    if effort is None:
+        # No effort record in the wire yet (fresh session before the
+        # first request): the built-in footer still shows the thinking
+        # suffix from the model's configured default_effort.
+        effort = model_default_efforts().get(payload.get("model") or "")
+
     # Rendering happens on every run (cache holds raw stats): the line is
     # fitted to the live terminal width, so a window resize takes effect
     # on the next refresh instead of after the wire files change.
     width = _terminal_width(payload)
     line = _fit_line(payload, session_total, sub_by_model,
-                     model_display_names(), swarm_on, effort, width)
+                     model_display_names(), swarm_on, effort, width,
+                     session_dir=session_dir)
     _debug(f"width={width} line={line!r}")
     print(line)
 
