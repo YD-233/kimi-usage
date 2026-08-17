@@ -647,7 +647,6 @@ _DARK_RAINBOW = ["#4FA8FF", "#5BC0BE", "#4EC87E", "#E8A838",
                  "#FFCB6B", "#C678B8", "#A274D9", "#7C8DFF"]
 _LIGHT_RAINBOW = ["#1565C0", "#00838F", "#0E7A38", "#92660A", "#9A4A00",
                   "#B91C1C", "#8A3A75", "#6B3A9A", "#354CB5"]
-_DANCE_FRAME_S = 0.110   # upstream DANCE_FRAME_MS = 110
 _DANCE_FLOW_S = 3.0      # upstream DANCE_FLOW_MS = 3000
 
 
@@ -994,10 +993,12 @@ def prefix_line(payload, display_names, swarm_on, effort,
             label += " thinking"
         dance = dance_state(payload.get("cwd") or "")
         if dance:
-            # /dance: flow animates by wall clock (one frame per 110ms);
+            # The TUI throttles status-line runs to ~1/s, so we can't
+            # replay upstream's 110ms frames. Stepping the phase by one
+            # palette slot per run turns the same refresh cadence into a
+            # slow gliding wave instead of a 9-slot jump each second.
             # "on" holds a static rainbow, same as upstream's freeze.
-            phase = (int(time.time() / _DANCE_FRAME_S)
-                     if dance == "flow" else 0)
+            phase = int(time.time()) if dance == "flow" else 0
             label = _rainbow_text(label, phase, _dance_palette())
         parts.append(label)
     if session_dir:
