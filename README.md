@@ -21,8 +21,6 @@
 
 ![状态行示例：含子 agent 分列、不同缓存率配色](images/statusline-examples.png)
 
-> 想预览/调整配色，仓库自带预览脚本：`python scripts/preview_colors.py`
-
 ## 特性
 
 - **零上下文消耗** —— 不向模型上下文注入任何内容
