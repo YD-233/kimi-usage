@@ -15,7 +15,7 @@
 
 缓存命中率带健康渐变：低红高绿，95% 以上显示一位小数（如 `97.8%`），现代渠道常见的高缓存区间每一格都可分辨：
 
-![缓存命中率渐变：0% 砖红到 100% 玉绿，95% 以上带小数](images/cache-gradient.png)
+<img width="714" height="101" alt="image" src="https://github.com/user-attachments/assets/3bd19861-1ac9-4d9e-91a5-17dd96f4df9c" />
 
 不同用量下的整行效果：
 
