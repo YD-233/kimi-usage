@@ -1,3 +1,5 @@
+
+
 # kimi-usage
 
 **[Kimi Code CLI](https://github.com/MoonshotAI/kimi-code) 插件：把当前会话的 token 用量显示在 TUI 底部状态栏。**
@@ -52,7 +54,7 @@
 
 ## 调试
 
-状态栏命令失败时 TUI 会保留上一次渲染的行（只有从没成功过才显示内置布局）。诊断日志写到 `~/.kimi-code/kimi-usage-debug.log`，两种开启方式：设 `KIMI_USAGE_DEBUG=1`（需重启 CLI），或 `touch ~/.kimi-code/kimi-usage-debug` 建一个开关文件（即时生效，删文件即关闭）。设 `KIMI_USAGE_NO_COLOR=1` 可输出纯文本。
+状态栏命令失败时 TUI 会保留上一次渲染的行（只有从没成功过才显示内置布局）。诊断日志写到 `~/.kimi-code/kimi-usage-debug.log`，两种开启方式：设 `KIMI_USAGE_DEBUG=1`（需重启 CLI），或 `touch ~/.kimi-code/kimi-usage-debug` 建一个开关文件（即时生效，删文件即关闭）。`TERM=dumb` 或设 `KIMI_USAGE_NO_COLOR=1` 可输出纯文本。
 
 也可以手动喂一个 JSON 快照，直接看脚本输出：
 
