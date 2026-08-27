@@ -748,14 +748,78 @@ def _truncate(s, width):
     return "".join(out)
 
 
+def _tty_columns(dev):
+    """Column count of an explicit tty device via TIOCGWINSZ, None on any
+    failure (missing device, someone else's tty, zero-size window)."""
+    try:
+        fd = os.open(dev, os.O_RDONLY)
+    except OSError:
+        return None
+    try:
+        w = os.get_terminal_size(fd).columns
+        return w if w > 0 else None
+    except OSError:
+        return None
+    finally:
+        os.close(fd)
+
+
+def _ancestor_tty_columns():
+    """Width via the tty an ancestor process sits on.
+
+    The TUI may spawn the status-line command detached from any
+    controlling terminal (kimi-code 0.38 on macOS: ps shows tty "??" for
+    the command and /dev/tty fails with ENXIO) while the TUI itself sits
+    on a real tty a couple of hops up. Walk the parent chain with ps and
+    TIOCGWINSZ the first real tty found. POSIX-only and best-effort
+    throughout: no ps, an unopenable tty or a slow machine just returns
+    None and width detection falls through to COLUMNS."""
+    import subprocess
+    deadline = time.monotonic() + 0.1   # the TUI kills us at 300ms total
+    pid, seen = os.getpid(), set()
+    for _ in range(10):
+        if pid <= 1 or pid in seen or time.monotonic() > deadline:
+            break
+        seen.add(pid)
+        try:
+            out = subprocess.run(
+                ["ps", "-o", "ppid=,tty=", "-p", str(pid)],
+                capture_output=True, text=True, timeout=0.1
+            ).stdout.split()
+        except Exception:
+            break
+        if len(out) < 2:
+            break
+        ppid, tty = out[0], out[1]
+        # "?" (procps) and "??" (BSD ps) both mean "no tty"; a real name is
+        # "ttys000" on macOS / "pts/3" on Linux, occasionally already
+        # prefixed with /dev/.
+        if tty not in ("?", "??"):
+            dev = tty if tty.startswith("/") else "/dev/" + tty
+            w = _tty_columns(dev)
+            if w:
+                return w
+            # every higher ancestor sits on the same terminal, so pressing
+            # on would only repeat the unopenable device
+            break
+        try:
+            pid = int(ppid)
+        except ValueError:
+            break
+    return None
+
+
 def _terminal_width(payload):
     """Best-effort width of the terminal the TUI is running in.
 
     The TUI snapshot carries no width field (checked against kimi-code
     0.30 docs) and stdout is a pipe, so the console is queried directly:
     CONOUT$ on Windows (the spawned command inherits the TUI's console),
-    /dev/tty on POSIX. Returns None when undetectable — the caller then
-    emits the full line and lets the TUI truncate as before."""
+    /dev/tty on POSIX — and when the command was spawned without a
+    controlling terminal, the tty of the ancestor the TUI itself runs on
+    (see _ancestor_tty_columns). Returns None when undetectable — the
+    caller then emits the full line and lets the TUI truncate as
+    before."""
     for key in ("width", "terminalWidth", "cols"):
         w = payload.get(key)
         if isinstance(w, int) and not isinstance(w, bool) and w > 0:
@@ -787,16 +851,11 @@ def _terminal_width(payload):
         except Exception:
             pass
     else:
-        try:
-            fd = os.open("/dev/tty", os.O_RDONLY)
-            try:
-                w = os.get_terminal_size(fd).columns
-                if w > 0:
-                    return w
-            finally:
-                os.close(fd)
-        except OSError:
-            pass
+        w = _tty_columns("/dev/tty")
+        if not w:
+            w = _ancestor_tty_columns()
+        if w:
+            return w
     try:
         w = int(os.environ.get("COLUMNS", ""))
         if w > 0:

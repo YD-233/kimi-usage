@@ -42,7 +42,7 @@
 
 - 已有自定义 `[status_line]` 段时：里面已有 `command` 的话插件**不会覆盖**（想换成本插件，把那行删掉，或指向 `plugins/managed/kimi-usage/scripts/statusline.py`）；只设了 `items` 的段落会被补上一行 `command`，两者并不冲突
 - 任何情况下都不会把 `tui.toml` 写坏：写入前会校验一遍，只要结果不是合法 TOML 就放弃（`kimi doctor tui` 可以自己复核）
-- 升级/指定版本：`/plugins install https://github.com/YD-233/kimi-usage/releases/tag/v1.5.2`
+- 升级/指定版本：`/plugins install https://github.com/YD-233/kimi-usage/releases/tag/v1.5.3`
 
 ## 卸载与恢复
 
