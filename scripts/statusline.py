@@ -4,8 +4,9 @@
 The TUI spawns this command up to once per second (300ms cap) with a JSON
 snapshot on stdin and renders the first stdout line as the footer status
 line. We parse the session wire files to show the session's total input /
-output tokens and cache hit rate, plus a per-model breakdown of sub-agent
-usage when sub-agents exist.
+output tokens and cache hit rate, plus the heaviest-consuming sub-agent
+model when sub-agents exist (the per-model totals behind that column stay
+in the cache; only the display is capped).
 
 Data source:
   <KIMI_CODE_HOME>/sessions/wd_*/session_*/agents/*/wire.jsonl
@@ -27,7 +28,10 @@ resort the line is cut with an ellipsis.
 The custom line replaces the built-in footer line 1 entirely (line 2, the
 right-aligned context readout, stays built-in), so the built-in slots that
 would otherwise vanish are reproduced here in upstream's order and
-spacing: mode badges, goal badge (wall clock anchored to when the goal
+spacing: mode badges (upstream's display names — "Ask When Needed" for
+yolo, "Never Ask" for auto, renamed in 0.40.0; the manual default shows
+no badge, same as upstream, and pre-0.40.0 TUIs get the raw names they
+themselves drew), goal badge (wall clock anchored to when the goal
 snapshot last changed, mirroring upstream's goalObservedAtMs), model +
 thinking effort (tracked from the wire's llm.request / profile.bind
 records, which follow /effort switches), background task badges, cwd, git
@@ -36,6 +40,16 @@ model label (detected from the per-cwd input history, where /dance
 commands are recorded; hold freezes at the same palette phase upstream's
 3s flow lands on). Only the rotating tips are skipped: upstream itself
 never renders them next to a custom line.
+
+Every built-in slot is painted with the footer's own ColorPalette tokens
+(warning for the permission modes, primary for plan/tasks/PR, accent for
+swarm/tower, textDim for cwd/git, textMuted for the goal badge), resolved
+from tui.toml's `theme` the way upstream does it: "light"/"dark" pick
+their built-in palettes, any other name is a custom theme merged from
+themes/<name>.json over its base ("dark" unless the file says
+`base = "light"`; invalid hex dropped, unreadable file falls back to
+dark), and "auto" collapses to dark because the terminal-background probe
+upstream uses cannot run over a status-line pipe.
 
 Fail-open by design: any error prints a fallback indicator so the user can
 see something is wrong, rather than silently falling back to the built-in
@@ -294,6 +308,7 @@ def find_session_dir(session_id, cwd):
 # the record itself — which used to clear the swarm badge.
 _WANTED_RECORDS = frozenset((
     "usage.record", "profile.bind", "swarm_mode.enter", "swarm_mode.exit",
+    "tower_mode.enter", "tower_mode.exit",
     "llm.request", "config.update",
 ))
 _TYPE_RE = re.compile(rb'^\{\s*"type"\s*:\s*"([^"]{1,40})"')
@@ -384,13 +399,17 @@ def _usage_of(rec, keys):
 
 
 def parse_session(session_dir, prior=None):
-    """Return (session_total, sub_by_model, swarm_on, effort, files).
+    """Return (session_total, sub_by_model, swarm_on, tower_on, effort,
+    files).
 
     session_total: usage aggregated over every agent in the session
     (main + sub-agents).
     sub_by_model:  {model: usage} aggregated over sub-agent wires only.
     swarm_on:      state of the last swarm_mode op persisted in the main
     wire (swarm mode is a wire Model, so the log is authoritative).
+    tower_on:      same for the tower_mode ops (0.39.0's experimental
+    multi-agent orchestration, dispatched as durable events from the
+    main agent exactly like swarm's).
     effort:        thinkingEffort of the latest effort-bearing record in
     the main wire. profile.bind is only written on (re)bind, so the
     freshest source is llm.request (written on every model request);
@@ -422,6 +441,7 @@ def parse_session(session_dir, prior=None):
         except (TypeError, ValueError):
             continue                   # skip the corrupt bucket only
     swarm_on = bool(prior.get("swarm"))
+    tower_on = bool(prior.get("tower"))
     effort = prior.get("effort")
     prior_files = prior.get("files")
     prior_files = prior_files if isinstance(prior_files, dict) else {}
@@ -456,9 +476,13 @@ def parse_session(session_dir, prior=None):
         chunk, offset, mid = read_wire_tail(wire, start,
                                             bool(cursor.get("mid")), size)
         for kind, rec in iter_wire_records(chunk):
-            if kind in ("swarm_mode.enter", "swarm_mode.exit"):
+            if kind in ("swarm_mode.enter", "swarm_mode.exit",
+                        "tower_mode.enter", "tower_mode.exit"):
                 if is_main:
-                    swarm_on = kind == "swarm_mode.enter"
+                    if kind.startswith("swarm_mode."):
+                        swarm_on = kind.endswith(".enter")
+                    else:
+                        tower_on = kind.endswith(".enter")
                 continue
             if kind == "profile.bind":
                 bound_model = rec.get("modelAlias") or bound_model
@@ -500,7 +524,7 @@ def parse_session(session_dir, prior=None):
         files[agent] = {"offset": offset, "mid": mid,
                         "bound": bound_model, "real": real_model}
 
-    return session_total, sub_by_model, swarm_on, effort, files
+    return session_total, sub_by_model, swarm_on, tower_on, effort, files
 
 
 # --------------------------------------------------------------------------
@@ -655,13 +679,20 @@ def _cache_sgr(rate):
     return "38;2;%d;%d;%d" % rgb
 
 
+# Sub-agent model columns the usage section shows at full width. The cap
+# lives at render time only: sub_by_model in the per-session cache (and in
+# parse_session's incremental aggregation) must keep every model, or the
+# ranking could never flip once a trimmed model's usage was dropped.
+_MAX_SUB_COLUMNS = 1
+
+
 def stats_line(session_total, sub_by_model, display_names,
                unit="token", total_label=True, cache_label=True,
                dot_spaces=True, max_subs=None):
-    """Session totals first, then per-model sub-agent usage, so the most
-    important info survives narrow terminals. Input is painted blue,
-    output magenta, and the cache rate on a red->green ramp. At 95%+ the
-    rate keeps one decimal (95.3%); only a true 100% stays an integer.
+    """Session totals first, then the heaviest sub-agent model (input
+    tokens decide; others stay in the cache, invisible). Input is painted
+    blue, output magenta, and the cache rate on a red->green ramp. At 95%+
+    the rate keeps one decimal (95.3%); only a true 100% stays an integer.
 
     Compaction knobs (used by _fit_line to degrade gracefully): unit is
     the token-unit suffix ("token" -> "tok" -> ""), total_label drops
@@ -866,7 +897,7 @@ def _terminal_width(payload):
 
 
 def _fit_line(payload, session_total, sub_by_model, display_names,
-              swarm_on, effort, width, session_dir=None,
+              swarm_on, tower_on, effort, width, session_dir=None,
               goal_observed=None):
     """Render prefix + stats to fit `width` columns by graceful
     degradation, cheapest losses first: unit "token" -> "tok" ->
@@ -889,14 +920,14 @@ def _fit_line(payload, session_total, sub_by_model, display_names,
         {"dot_spaces": False},
     ]
 
-    def compose(o, max_subs=None, with_prefix=True):
+    def compose(o, max_subs=_MAX_SUB_COLUMNS, with_prefix=True):
         usage = stats_line(session_total, sub_by_model, display_names,
                            unit=o["unit"], total_label=o["total_label"],
                            cache_label=o["cache_label"],
                            dot_spaces=o["dot_spaces"], max_subs=max_subs)
         if not with_prefix:
             return usage
-        p = prefix_line(payload, display_names, swarm_on, effort,
+        p = prefix_line(payload, display_names, swarm_on, tower_on, effort,
                         with_cwd=o["with_cwd"], with_git=o["with_git"],
                         session_dir=session_dir, goal_observed=goal_observed)
         return f"{p} | {usage}" if p else usage
@@ -910,7 +941,7 @@ def _fit_line(payload, session_total, sub_by_model, display_names,
         line = compose(opts)
         if _visible_len(line) <= width:
             return line
-    n = len(sub_by_model)
+    n = min(len(sub_by_model), _MAX_SUB_COLUMNS)
     while n > 0:
         n -= 1
         line = compose(opts, max_subs=n)
@@ -942,12 +973,115 @@ _SGR_CLOSE = "\x1b[22m\x1b[39m"
 def _paint(text, code):
     """Wrap text in an ANSI SGR escape. The TUI paints the whole custom
     line in colors.text, so embedded escapes reproduce the built-in
-    footer's per-slot colors: amber bold for auto/yolo, blue bold for
-    plan, dim for cwd/git. Named colors follow the terminal's own palette,
-    which keeps theme="auto" sensible in both dark and light terminals."""
+    footer's per-slot colors; closing with _SGR_CLOSE lets chalk re-open
+    the wrapper color after each span. Codes are 24-bit SGR for palette
+    tokens (see _token_sgr) and basic ANSI for the usage section."""
     if not text or not _colors_on():
         return text
     return f"\x1b[{code}m{text}{_SGR_CLOSE}"
+
+
+# --------------------------------------------------------------------------
+# footer theme palette (upstream src/tui/theme/colors.ts)
+# --------------------------------------------------------------------------
+
+# The built-in ColorPalettes, cut down to the tokens the footer slots use.
+_DARK_PALETTE = {"primary": "#4FA8FF", "accent": "#5BC0BE",
+                 "textDim": "#888888", "textMuted": "#6B6B6B",
+                 "warning": "#E8A838"}
+_LIGHT_PALETTE = {"primary": "#1565C0", "accent": "#00838F",
+                  "textDim": "#454545", "textMuted": "#5F5F5F",
+                  "warning": "#92660A"}
+
+_THEME_TOKENS_RE = re.compile(r"^#[0-9a-fA-F]{6}$")
+
+
+@_memo
+def _tui_theme():
+    """The `theme` value from tui.toml (None when unset/unreadable —
+    upstream's default is "auto")."""
+    try:
+        with open(os.path.join(kimi_home(), "tui.toml"),
+                  encoding="utf-8") as f:
+            m = re.search(r'(?m)^\s*theme\s*=\s*"([^"]*)"', f.read())
+        return m.group(1) if m else None
+    except OSError:
+        return None
+
+
+@_memo
+def _custom_theme(name):
+    """(base, {token: "#hex"}) from themes/<name>.json, mirroring
+    upstream's custom-theme loader: `base` is "dark" unless the file says
+    "light", hex values are validated (invalid ones fall back to the
+    base palette) and only the tokens the footer renders are kept."""
+    try:
+        with open(os.path.join(kimi_home(), "themes", f"{name}.json"),
+                  encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    colors = data.get("colors")
+    out = {}
+    if isinstance(colors, dict):
+        for token, hexc in colors.items():
+            if isinstance(hexc, str) and _THEME_TOKENS_RE.match(hexc):
+                out[str(token)] = hexc
+    return ("light" if data.get("base") == "light" else "dark"), out
+
+
+@_memo
+def footer_palette():
+    """The footer's five ColorPalette tokens, resolved like upstream's
+    getColorPalette: "light"/"dark" are the built-ins, any other string a
+    custom theme (merged over its base; a missing or invalid file falls
+    back to dark), and "auto" collapses to dark — upstream detects the
+    terminal background, which a status-line pipe cannot do."""
+    theme = _tui_theme()
+    palette = dict(_LIGHT_PALETTE if theme == "light" else _DARK_PALETTE)
+    if theme not in (None, "dark", "light", "auto"):
+        custom = _custom_theme(theme)
+        if custom is not None:
+            base, colors = custom
+            palette = dict(_LIGHT_PALETTE if base == "light"
+                           else _DARK_PALETTE)
+            palette.update({t: c for t, c in colors.items() if t in palette})
+    return palette
+
+
+def _token_sgr(token, bold=False):
+    """SGR parameters painting `token` from the resolved footer palette as
+    24-bit truecolor, optionally bold — the same colors upstream's
+    chalk.hex(colors.<token>).bold() would emit."""
+    r, g, b = (int(footer_palette()[token][i:i + 2], 16)
+               for i in (1, 3, 5))
+    return f"38;2;{r};{g};{b}" + (";1" if bold else "")
+
+
+# PERMISSION_MODE_DISPLAY_NAMES from upstream's
+# src/tui/utils/permission-mode.ts (0.40.0's rename). The footer draws
+# these for the non-default permission modes and nothing at all for the
+# "Always Ask"/manual default.
+PERMISSION_MODE_DISPLAY_NAMES = {"manual": "Always Ask",
+                                 "yolo": "Ask When Needed",
+                                 "auto": "Never Ask"}
+
+# What pre-0.40.0 footers drew for the same modes.
+_LEGACY_MODE_LABELS = {"auto": "auto", "yolo": "yolo"}
+
+
+def _version_tuple(v):
+    """(major, minor, patch) of a semver-ish string, None when absent or
+    unparseable."""
+    parts = []
+    for piece in str(v or "").split("."):
+        m = re.match(r"\d+", piece)
+        if m is None:
+            return None
+        parts.append(int(m.group(0)))
+    return tuple((parts + [0, 0, 0])[:3]) if parts else None
 
 
 # --------------------------------------------------------------------------
@@ -966,14 +1100,7 @@ _DANCE_FLOW_S = 3.0      # upstream DANCE_FLOW_MS = 3000
 def _dance_palette():
     """Light palette only for an explicit light theme; dark otherwise
     (upstream picks by theme text color, which we can't see)."""
-    try:
-        with open(os.path.join(kimi_home(), "tui.toml"),
-                  encoding="utf-8") as f:
-            if re.search(r'(?m)^\s*theme\s*=\s*"light"', f.read()):
-                return _LIGHT_RAINBOW
-    except OSError:
-        pass
-    return _DARK_RAINBOW
+    return _LIGHT_RAINBOW if _tui_theme() == "light" else _DARK_RAINBOW
 
 
 def _rainbow_text(text, phase, palette):
@@ -1144,9 +1271,12 @@ def goal_badge(session_dir, observed_at=None):
         elapsed = f"{secs // 60}m"
     else:
         elapsed = f"{secs // 3600}h{secs % 3600 // 60}m"
-    dot = {"active": "36", "blocked": "33", "paused": "2"}[status]
-    return (_paint("[goal ", "2") + _paint("●", dot)
-            + _paint(f" {status} · {elapsed} · {turns}]", "2"))
+    dot = {"active": _token_sgr("primary"),
+           "blocked": _token_sgr("warning"),
+           "paused": _token_sgr("textMuted")}[status]
+    muted = _token_sgr("textMuted")
+    return (_paint("[goal ", muted) + _paint("●", dot)
+            + _paint(f" {status} · {elapsed} · {turns}]", muted))
 
 
 _TASKS_CACHE_TTL = 2.0    # badges may lag a task start/finish by this much
@@ -1218,10 +1348,12 @@ def task_badges(session_dir):
     badges = []
     if bash_n:
         noun = "task" if bash_n == 1 else "tasks"
-        badges.append(_paint(f"[{bash_n} {noun} running]", "36"))
+        badges.append(_paint(f"[{bash_n} {noun} running]",
+                             _token_sgr("primary")))
     if agent_n:
         noun = "agent" if agent_n == 1 else "agents"
-        badges.append(_paint(f"[{agent_n} {noun} running]", "36"))
+        badges.append(_paint(f"[{agent_n} {noun} running]",
+                             _token_sgr("primary")))
     return badges
 
 
@@ -1501,12 +1633,13 @@ def shorten_cwd(path):
     return "…/" + "/".join(segments[-3:])
 
 
-def prefix_line(payload, display_names, swarm_on, effort,
+def prefix_line(payload, display_names, swarm_on, tower_on, effort,
                 with_cwd=True, with_git=True, session_dir=None,
                 goal_observed=None):
     """Rebuilt on every run (not cached). Reproduces the built-in footer
     line 1 slots in the original order and spacing (two-space
-    separated): mode badges (bare words, only when active), goal badge,
+    separated): mode badges (display names since 0.40.0, non-default
+    modes only, warning/primary/accent + bold), goal badge,
     model display_name with thinking-effort suffix (rainbow-painted
     while /dance is on), background task badges, shortened cwd, git
     branch with dirty/ahead/behind stats and PR badge. with_cwd /
@@ -1522,14 +1655,27 @@ def prefix_line(payload, display_names, swarm_on, effort,
     parts = []
     modes = []
     perm = payload.get("permissionMode") or ""
+    # The mode slot as footer.ts renders it: non-default permission modes
+    # in warning + bold (labels follow the spawning TUI's naming — the
+    # payload's version field tells us whether it draws 0.40.0's display
+    # names or the pre-rename raw modes), then plan in primary, swarm and
+    # tower in accent. Single-space joined inside the slot.
+    version = _version_tuple(payload.get("version"))
+    labels = (PERMISSION_MODE_DISPLAY_NAMES
+              if version is None or version >= (0, 40, 0)
+              else _LEGACY_MODE_LABELS)
+    # two explicit ifs, same as footer.ts: the manual default draws no badge
     if perm == "auto":
-        modes.append(_paint("auto", "33;1"))
+        modes.append(_paint(labels["auto"], _token_sgr("warning", bold=True)))
     if perm == "yolo":
-        modes.append(_paint("yolo", "33;1"))
+        modes.append(_paint(labels["yolo"], _token_sgr("warning", bold=True)))
     if payload.get("planMode"):
-        modes.append(_paint("plan", "34;1"))
+        modes.append(_paint("plan", _token_sgr("primary", bold=True)))
     if swarm_on:
-        modes.append(_paint("swarm", "36;1"))
+        modes.append(_paint("swarm", _token_sgr("accent", bold=True)))
+    if tower_on:
+        # upstream paints tower with the same accent color as swarm
+        modes.append(_paint("tower", _token_sgr("accent", bold=True)))
     if modes:
         parts.append(" ".join(modes))
     if session_dir:
@@ -1563,20 +1709,21 @@ def prefix_line(payload, display_names, swarm_on, effort,
         parts.extend(task_badges(session_dir))
     cwd = shorten_cwd(payload.get("cwd") or "") if with_cwd else ""
     if cwd:
-        parts.append(_paint(cwd, "2"))
+        parts.append(_paint(cwd, _token_sgr("textDim")))
     branch = payload.get("gitBranch") if with_git else None
     if branch:
         workdir = payload.get("cwd") or ""
         status = git_status(workdir)
-        slot = _paint(git_badge(branch, status), "2")
+        slot = _paint(git_badge(branch, status), _token_sgr("textDim"))
         if status is not None:
             # The PR badge belongs to the git slot: painted in the theme's
-            # primary color (approximated by cyan here) and hyperlinked,
-            # same as upstream's formatFooterGitBadge.
+            # primary color and hyperlinked, same as upstream's
+            # formatFooterGitBadge.
             pr = pr_status(workdir, branch)
             if pr:
                 slot += " " + _paint(
-                    _hyperlink(f"[PR#{pr['number']}]", pr["url"]), "36")
+                    _hyperlink(f"[PR#{pr['number']}]", pr["url"]),
+                    _token_sgr("primary"))
         parts.append(slot)
     return "  ".join(parts)
 
@@ -1585,7 +1732,7 @@ def prefix_line(payload, display_names, swarm_on, effort,
 # per-session cache (parse cursors + the totals they produced)
 # --------------------------------------------------------------------------
 
-_CACHE_VERSION = 11
+_CACHE_VERSION = 12
 
 
 def _cache_path(session_id):
@@ -1614,8 +1761,8 @@ def _load_cache(session_id):
     return None
 
 
-def _save_cache(session_id, session_total, sub_by_model, swarm_on, effort,
-                files, goal_key=None, goal_observed=None):
+def _save_cache(session_id, session_total, sub_by_model, swarm_on, tower_on,
+                effort, files, goal_key=None, goal_observed=None):
     path = _cache_path(session_id)
     tmp = f"{path}.{os.getpid()}.tmp"
     try:
@@ -1623,6 +1770,7 @@ def _save_cache(session_id, session_total, sub_by_model, swarm_on, effort,
             json.dump({"v": _CACHE_VERSION,
                        "session_total": session_total,
                        "sub_by_model": sub_by_model, "swarm": swarm_on,
+                       "tower": tower_on,
                        "effort": effort, "files": files,
                        "goal_key": goal_key,
                        "goal_seen_at": goal_observed}, f)
@@ -1638,15 +1786,38 @@ def main():
     global _RUN_STARTED
     _RUN_STARTED = time.monotonic()
     _debug("invoked")
-    if plugin_disabled():
-        # Exit non-zero: the TUI treats that as a failure and renders its own
-        # footer again, which is exactly what a disabled plugin should leave
-        # behind.
-        _debug("plugin disabled or removed; restoring the built-in footer")
-        restore_builtin_statusline()
-        sys.exit(1)
     payload = _read_stdin_json()
     _debug(f"payload keys={list(payload.keys())}")
+    if plugin_disabled():
+        # Stand down without leaving a frozen line behind. A failed command
+        # only ever preserves the TUI's cached output — exiting non-zero
+        # here used to keep the last usage line on screen until
+        # /reload-tui. So the current session gets the built-in layout
+        # rendered directly instead: every built-in slot except the usage
+        # section, which is ours to remove. The rotating tips are the one
+        # slot that cannot be reproduced, and upstream never renders them
+        # next to a custom line anyway. Mode badges and effort come from
+        # the wire (warm cache: only new bytes) so a swarm/tower session
+        # keeps its badge instead of losing it mid-mode. This runs once a
+        # second until /reload-tui or a restart stops the spawning;
+        # restore_builtin_statusline() already scrubbed tui.toml for
+        # everything after.
+        _debug("plugin disabled or removed; rendering the built-in replica")
+        restore_builtin_statusline()
+        model = payload.get("model") or ""
+        effort = model_default_efforts().get(model)
+        session_id = payload.get("sessionId") or payload.get("session_id")
+        session_dir = find_session_dir(session_id,
+                                       payload.get("cwd") or os.getcwd())
+        swarm_on = tower_on = False
+        if session_dir:
+            _, _, swarm_on, tower_on, effort, _ = parse_session(
+                session_dir, _load_cache(session_id) if session_id else None)
+            if effort is None:
+                effort = model_default_efforts().get(model)
+        print(prefix_line(payload, model_display_names(), swarm_on,
+                          tower_on, effort, session_dir=session_dir))
+        return
     session_id = payload.get("sessionId") or payload.get("session_id")
     cwd = payload.get("cwd") or os.getcwd()
 
@@ -1658,15 +1829,17 @@ def main():
         # from the snapshot; the effort suffix falls back to the model's
         # default_effort from config.toml since there is no wire log.
         effort = model_default_efforts().get(payload.get("model") or "")
-        prefix = prefix_line(payload, model_display_names(), False, effort)
-        note = _paint("开启对话以显示上下文情况", "2")
+        prefix = prefix_line(payload, model_display_names(), False, False,
+                             effort)
+        note = _paint("开启对话以显示上下文情况",
+                      _token_sgr("textMuted"))
         line = f"{prefix} | {note}" if prefix else note
         _debug(f"line={line!r}")
         print(line)
         return
 
     prior = _load_cache(session_id) if session_id else None
-    session_total, sub_by_model, swarm_on, effort, files = \
+    session_total, sub_by_model, swarm_on, tower_on, effort, files = \
         parse_session(session_dir, prior)
 
     # Wall-clock anchor for a live goal badge, mirroring upstream's
@@ -1690,10 +1863,10 @@ def main():
     if session_id and (files != (prior or {}).get("files")
                        or goal_key != (prior or {}).get("goal_key")
                        or anchor_unsaved):
-        _debug(f"swarm_on={swarm_on} effort={effort!r} "
+        _debug(f"swarm_on={swarm_on} tower_on={tower_on} effort={effort!r} "
                f"sub_models={list(sub_by_model)}")
         _save_cache(session_id, session_total, sub_by_model, swarm_on,
-                    effort, files, goal_key, goal_observed)
+                    tower_on, effort, files, goal_key, goal_observed)
 
     if effort is None:
         # No effort record in the wire yet (fresh session before the
@@ -1712,7 +1885,7 @@ def main():
         # letting our own degradation ladder drop a slot.
         width = max(1, width - 2 * _CHROME_GUTTER)
     line = _fit_line(payload, session_total, sub_by_model,
-                     model_display_names(), swarm_on, effort, width,
+                     model_display_names(), swarm_on, tower_on, effort, width,
                      session_dir=session_dir, goal_observed=goal_observed)
     _debug(f"width={width} line={line!r}")
     print(line)
@@ -1722,7 +1895,16 @@ if __name__ == "__main__":
     force_utf8_stdout()
     try:
         main()
+        # total wall clock including interpreter startup is invisible to
+        # the in-run budgets; this line is how a startup-cost problem
+        # (kill at the 300ms cap, frozen line) stops being a guess
+        if _RUN_STARTED is not None:
+            _debug(f"run complete in "
+                   f"{int((time.monotonic() - _RUN_STARTED) * 1000)}ms")
     except Exception as e:
         _debug(f"exception: {e}\n{traceback.format_exc()}")
-        print("kimi-usage: 错误")
+        # the error line is all the user sees; surface the exception's
+        # first line on it instead of a bare label
+        reason = " ".join(str(e).split())[:40] or type(e).__name__
+        print(f"kimi-usage: 错误 ({reason})")
     sys.exit(0)

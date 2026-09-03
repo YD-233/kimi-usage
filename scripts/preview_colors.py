@@ -56,12 +56,22 @@ def main():
         print(f"  {r:>5.1f}%  {swatch}  {label}")
 
     print()
+    print("模式徽标（主题色板：warning / primary / accent，加粗）：")
+    for label, token in (("Ask When Needed (yolo)", "warning"),
+                         ("Never Ask (auto)", "warning"),
+                         ("plan", "primary"),
+                         ("swarm", "accent"),
+                         ("tower", "accent")):
+        print(f"  {statusline._paint(label, statusline._token_sgr(token, bold=True))}")
+
+    print()
     print("完整状态行示例：")
     payload = {"permissionMode": "yolo", "planMode": False,
                "model": "kimi-code/k3-256k",
-               "cwd": "D:/project/kimi-usage", "gitBranch": "main"}
+               "cwd": "D:/project/kimi-usage", "gitBranch": "main",
+               "version": "0.40.1"}
     prefix = statusline.prefix_line(payload, statusline.model_display_names(),
-                                    False, "max")
+                                    False, False, "max")
     examples = [
         statusline.stats_line(usage(968, 32, 100), {},
                               statusline.model_display_names()),
